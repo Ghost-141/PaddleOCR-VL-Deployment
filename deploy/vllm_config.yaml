@@ -1,0 +1,5 @@
+# PaddleOCR's documented RTX 3060 recommendation also leaves room for the
+# layout model when both services share one 24 GB GPU.
+gpu-memory-utilization: 0.60
+max-num-seqs: 128
+

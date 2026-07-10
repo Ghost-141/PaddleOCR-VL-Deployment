@@ -1,0 +1,45 @@
+# Version control and local tooling
+.git
+.gitignore
+.agents
+.codex
+.idea
+.vscode
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Python environments and caches
+.venv
+venv
+env
+**/__pycache__
+**/*.py[cod]
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+htmlcov
+
+# Tests and development artifacts are not needed at runtime
+tests
+build
+dist
+*.egg-info
+*.log
+
+# Runtime data and models must use Docker volumes
+uploads
+outputs
+app-data
+models
+model-cache
+
+# Editor and OS files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
