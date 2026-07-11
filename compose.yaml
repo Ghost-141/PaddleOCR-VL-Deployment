@@ -1,13 +1,27 @@
 name: paddleocr-vl
 
 services:
+  model-setup:
+    build:
+      context: .
+      args:
+        PADDLEOCR_IMAGE: ${API_BASE_IMAGE:-ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddleocr-vl:latest-nvidia-gpu-offline}
+    user: root
+    environment:
+      HF_TOKEN: ${HF_TOKEN:-}
+    volumes:
+      - ./models:/models
+      - huggingface-cache:/root/.cache
+    command: ["bash", "/app/scripts/download_models.sh"]
+
   paddleocr-vlm-server:
-    image: ${VLLM_IMAGE:-ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddleocr-genai-vllm-server:latest-nvidia-gpu}
+    image: ${VLLM_IMAGE:-ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddleocr-genai-vllm-server:latest-nvidia-gpu-offline}
+    user: root
     command:
       - paddleocr
       - genai_server
       - --model_name
-      - ${VLLM_SERVER_MODEL_NAME:-PaddleOCR-VL-1.6-0.9B}
+      - PaddleOCR-VL-1.6-0.9B
       - --host
       - 0.0.0.0
       - --port
@@ -18,7 +32,8 @@ services:
       - /opt/paddleocr/vllm_config.yaml
     volumes:
       - ./deploy/vllm_config.yaml:/opt/paddleocr/vllm_config.yaml:ro
-      - model-cache:/root/.cache
+    environment:
+      PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK: "True"
     shm_size: 8gb
     restart: unless-stopped
     deploy:
@@ -29,7 +44,7 @@ services:
               device_ids: ["${GPU_DEVICE_ID:-0}"]
               capabilities: [gpu]
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health || exit 1"]
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8118/health || exit 1"]
       start_period: 10m
       interval: 15s
       timeout: 5s
@@ -39,29 +54,24 @@ services:
     build:
       context: .
       args:
-        PADDLEOCR_IMAGE: ${API_BASE_IMAGE:-ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddleocr-vl:latest-nvidia-gpu}
+        PADDLEOCR_IMAGE: ${API_BASE_IMAGE:-ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddleocr-vl:latest-nvidia-gpu-offline}
     ports:
       - "${APP_PORT:-8080}:8080"
     environment:
       PUBLIC_API_KEY: ${PUBLIC_API_KEY:?Set PUBLIC_API_KEY in .env}
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK: "True"
       VLLM_API_KEY: ${VLLM_API_KEY:-EMPTY}
-      VLLM_SERVER_URL: ${VLLM_SERVER_URL:-http://paddleocr-vlm-server:8118/v1}
-      VLLM_MODEL_NAME: ${VLLM_MODEL_NAME:-PaddleOCR-VL-1.6-0.9B}
-      PIPELINE_VERSION: ${PIPELINE_VERSION:-v1.6}
-      LAYOUT_MODEL_NAME: ${LAYOUT_MODEL_NAME:-PP-DocLayoutV2}
-      VL_REC_MAX_CONCURRENCY: ${VL_REC_MAX_CONCURRENCY:-1}
+      DEVICE: ${DEVICE:-gpu:0}
       MAX_FILE_SIZE_MB: ${MAX_FILE_SIZE_MB:-100}
       MAX_PAGES: ${MAX_PAGES:-100}
-      DELETE_TEMP_FILES: ${DELETE_TEMP_FILES:-true}
-      UPLOAD_DIR: ${UPLOAD_DIR:-/data/uploads}
-      OUTPUT_DIR: ${OUTPUT_DIR:-/data/outputs}
     volumes:
       - app-data:/data
-      - model-cache:/root/.cache
+      - ./models:/models:ro
     shm_size: 8gb
     restart: unless-stopped
     depends_on:
+      model-setup:
+        condition: service_completed_successfully
       paddleocr-vlm-server:
         condition: service_healthy
     deploy:
@@ -80,4 +90,4 @@ services:
 
 volumes:
   app-data:
-  model-cache:
+  huggingface-cache:
