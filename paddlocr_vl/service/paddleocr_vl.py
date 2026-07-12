@@ -8,6 +8,7 @@ from typing import Any
 from paddleocr import PaddleOCRVL
 
 from ..core.config import Settings
+from ..utils.file_utils import read_json
 from ..utils.markdown_assembler import assemble_page_markdown
 
 
@@ -92,7 +93,9 @@ class PaddleOCRVLService:
         def _process_page(index: int, result: Any) -> tuple[int, dict[str, Any], str]:
             json_path = output_dir / f"page_{index}.json"
             result.save_to_json(save_path=str(json_path))
-            page_json = dict(result)
+            page_json = read_json(json_path)
+            if not isinstance(page_json, dict):
+                raise RuntimeError(f"Invalid PaddleOCR JSON result: {json_path}")
             page_markdown = assemble_page_markdown(page_json)
             markdown_path = output_dir / f"page_{index}.md"
             markdown_path.write_text(page_markdown + "\n", encoding="utf-8")

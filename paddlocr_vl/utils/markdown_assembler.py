@@ -33,6 +33,10 @@ def assemble_document_markdown(pages: Sequence[Mapping[str, Any]]) -> str:
 
 
 def assemble_page_markdown(page: Mapping[str, Any]) -> str:
+    result = page.get("res")
+    if isinstance(result, Mapping):
+        page = result
+
     ignore_labels = set(DEFAULT_IGNORE_LABELS)
     model_settings = page.get("model_settings")
     if isinstance(model_settings, Mapping):

@@ -49,8 +49,7 @@ async def _parse_document(
         }
         if output_format in {OutputFormat.JSON, OutputFormat.BOTH}:
             response["pages"] = [
-                {"page": page["page"], "json": page["json"]}
-                for page in result["pages"]
+                {"page": page["page"], "json": page["json"]} for page in result["pages"]
             ]
         if output_format in {OutputFormat.MARKDOWN, OutputFormat.BOTH}:
             response["combined_markdown"] = result["combined_markdown"]
@@ -96,6 +95,4 @@ async def parse_pdf(
     extension = validate_upload(file)
     if extension != ".pdf":
         raise HTTPException(415, "This endpoint accepts PDF files only")
-    return await _parse_document(
-        file, settings, ocr_service, output_format, extension
-    )
+    return await _parse_document(file, settings, ocr_service, output_format, extension)
