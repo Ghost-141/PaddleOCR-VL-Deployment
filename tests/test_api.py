@@ -112,16 +112,11 @@ def test_parse_image_returns_both_formats_and_cleans_temp_files(
     assert not output_dir.exists()
 
 
-@pytest.mark.parametrize(
-    ("output_format", "has_pages", "has_markdown"),
-    [("json", True, False), ("markdown", False, True), ("both", True, True)],
-)
+@pytest.mark.parametrize("output_format", ["json", "markdown", "both"])
 def test_parse_pdf_output_formats(
     settings_factory: Callable[..., Settings],
     auth_headers: dict[str, str],
     output_format: str,
-    has_pages: bool,
-    has_markdown: bool,
 ) -> None:
     client = make_client(settings_factory(), FakeOCRService())
 
@@ -132,11 +127,21 @@ def test_parse_pdf_output_formats(
     )
 
     assert response.status_code == 200
+    if output_format == "markdown":
+        assert response.headers["content-type"].startswith("text/markdown")
+        assert response.headers["content-disposition"].endswith('.md"')
+        assert response.headers["x-processed-pages"] == "1"
+        assert response.text == "Parsed text"
+        return
+
     body = response.json()
-    assert ("pages" in body) is has_pages
-    assert ("combined_markdown" in body) is has_markdown
     if output_format == "json":
+        assert "pages" in body
+        assert "combined_markdown" not in body
         assert "markdown" not in body["pages"][0]
+    else:
+        assert body["combined_markdown"] == "Parsed text"
+        assert body["pages"][0]["markdown"] == "Parsed text"
 
 
 @pytest.mark.parametrize(

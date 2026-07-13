@@ -9,25 +9,30 @@ from paddlocr_vl.core.config import Settings
 from paddlocr_vl.service.paddleocr_vl import PaddleOCRVLService
 
 
-class FakeResult:
+class FakeResult(dict):
     def __init__(self, title: str) -> None:
+        super().__init__(
+            {
+                "parsing_res_list": [
+                    {
+                        "block_label": "paragraph_title",
+                        "block_content": title,
+                        "block_bbox": [0, 0, 10, 10],
+                        "block_order": 1,
+                        "global_block_id": 1,
+                    }
+                ]
+            }
+        )
         self.title = title
+
+    @property
+    def json(self) -> dict[str, dict[str, Any]]:
+        return {"res": dict(self)}
 
     def save_to_json(self, save_path: str) -> None:
         Path(save_path).write_text(
-            json.dumps(
-                {
-                    "parsing_res_list": [
-                        {
-                            "block_label": "paragraph_title",
-                            "block_content": self.title,
-                            "block_bbox": [0, 0, 10, 10],
-                            "block_order": 1,
-                            "global_block_id": 1,
-                        }
-                    ]
-                }
-            ),
+            json.dumps(dict(self)),
             encoding="utf-8",
         )
 
@@ -98,7 +103,9 @@ def test_predict_saves_pages_assembles_markdown_and_restructures_pdf(
     result = service.predict(input_path, tmp_path / "result")
 
     assert result["processed_pages"] == 2
-    assert result["combined_markdown"] == "# First\n\n# Second"
+    assert result["combined_markdown"] == (
+        "# First\n\n---\n\n_Page 2_\n\n# Second"
+    )
     assert result["pages"][0]["markdown"] == "# First"
     assert pipeline.restructure_calls == [
         {
@@ -107,7 +114,6 @@ def test_predict_saves_pages_assembles_markdown_and_restructures_pdf(
             "concatenate_pages": False,
         }
     ]
-    assert (tmp_path / "result" / "page_1.json").is_file()
     assert (tmp_path / "result" / "page_1.md").read_text() == "# First\n"
 
 

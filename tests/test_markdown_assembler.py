@@ -59,3 +59,34 @@ def test_assemble_document_markdown_joins_pages_without_page_noise() -> None:
     )
 
     assert document == "## Page 1\n\nFirst page text.\n\n## Page 2\n\nSecond page text."
+
+
+def test_assemble_page_markdown_accepts_paddle_result_wrapper() -> None:
+    page = {
+        "res": {
+            "parsing_res_list": [
+                {
+                    "block_label": "text",
+                    "block_content": "Parsed text",
+                    "block_bbox": [0, 0, 100, 20],
+                }
+            ]
+        }
+    }
+
+    assert assemble_page_markdown(page) == "Parsed text"
+
+
+def test_assemble_page_markdown_maps_titles_and_keeps_reading_order() -> None:
+    page = {
+        "parsing_res_list": [
+            {"block_label": "doc_title", "block_content": "Document", "block_order": 1},
+            {"block_label": "text", "block_content": "Introduction", "block_order": 2},
+            {"block_label": "section_title", "block_content": "Details", "block_order": 3},
+            {"block_label": "text", "block_content": "Body", "block_order": 4},
+        ]
+    }
+
+    assert assemble_page_markdown(page) == (
+        "# Document\n\nIntroduction\n\n## Details\n\nBody"
+    )
