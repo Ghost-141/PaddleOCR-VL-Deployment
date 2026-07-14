@@ -1,114 +1,189 @@
 from __future__ import annotations
 
-import shutil
-from typing import Annotated
+from pathlib import Path
+from typing import Annotated, Any
 import uuid
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 
 from ...core.config import Settings
-from ...core.dependencies import authorize, get_ocr_service, get_settings
-from ...service import PaddleOCRVLService
-from ...schemas import OutputFormat, ParseResponse
-from ...utils.file_utils import (
-    json_compatible,
-    save_upload,
-    validate_image_upload,
-    validate_upload,
+from ...core.dependencies import (
+    authorize,
+    get_job_store,
+    get_owner_id,
+    get_settings,
+    get_triton_client,
 )
+from ...jobs import JobStore, QueueFullError
+from ...pdf_utils import EncryptedPDFError, InvalidPDFError, inspect_pdf
+from ...schemas import OutputFormat, ParseResponse
+from ...service import TritonClient, TritonError
+from ...utils.file_utils import json_compatible, save_upload, validate_image_upload, validate_upload
+from ...utils.markdown_assembler import assemble_page_markdown
 
 router = APIRouter(tags=["documents"], dependencies=[Depends(authorize)])
 
 
-async def _parse_document(
-    file: UploadFile,
-    settings: Settings,
-    ocr_service: PaddleOCRVLService,
-    output_format: OutputFormat,
-    extension: str,
-) -> Response:
-    request_id = uuid.uuid4().hex
-    upload_path = settings.upload_dir / f"{request_id}{extension}"
-    output_dir = settings.output_dir / request_id
-    try:
-        size = await save_upload(file, upload_path, settings.max_file_size_bytes)
-        try:
-            result = await run_in_threadpool(
-                ocr_service.predict, upload_path, output_dir
-            )
-        except Exception as exc:
-            raise HTTPException(502, f"Document parsing failed: {exc}") from exc
-        if output_format is OutputFormat.MARKDOWN:
-            return Response(
-                content=result["combined_markdown"],
-                media_type="text/markdown",
-                headers={
-                    "Content-Disposition": f'attachment; filename="{request_id}.md"',
-                    "X-Request-ID": request_id,
-                    "X-Processed-Pages": str(result["processed_pages"]),
-                },
-            )
-        response: dict[str, object] = {
-            "request_id": request_id,
-            "filename": file.filename,
-            "content_type": file.content_type,
-            "file_size_bytes": size,
-            "processed_pages": result["processed_pages"],
-        }
-        if output_format in {OutputFormat.JSON, OutputFormat.BOTH}:
-            response["pages"] = [
-                {"page": page["page"], "json": page["json"]} for page in result["pages"]
-            ]
-        if output_format is OutputFormat.BOTH:
-            response["combined_markdown"] = result["combined_markdown"]
-            response["pages"] = result["pages"]
-        return JSONResponse(json_compatible(response))
-    finally:
-        if settings.delete_temp_files:
-            upload_path.unlink(missing_ok=True)
-            shutil.rmtree(output_dir, ignore_errors=True)
-
-
 @router.post(
-    "/parse/image",
-    response_model=ParseResponse,
-    response_model_exclude_none=True,
+    "/parse/image", response_model=ParseResponse, response_model_exclude_none=True
 )
 async def parse_image(
     file: Annotated[UploadFile, File(...)],
     settings: Annotated[Settings, Depends(get_settings)],
-    ocr_service: Annotated[PaddleOCRVLService, Depends(get_ocr_service)],
+    client: Annotated[TritonClient, Depends(get_triton_client)],
 ) -> Response:
     extension = validate_image_upload(file)
-    return await _parse_document(
-        file, settings, ocr_service, OutputFormat.BOTH, extension
-    )
+    request_id = uuid.uuid4().hex
+    upload_path = settings.upload_dir / f"{request_id}{extension}"
+    try:
+        size = await save_upload(file, upload_path, settings.max_file_size_bytes)
+        try:
+            page = await run_in_threadpool(client.infer, upload_path)
+        except TritonError as exc:
+            raise HTTPException(502, f"Document parsing failed: {exc}") from exc
+        markdown = assemble_page_markdown(page)
+        return JSONResponse(
+            json_compatible(
+                {
+                    "request_id": request_id,
+                    "filename": file.filename,
+                    "content_type": file.content_type,
+                    "file_size_bytes": size,
+                    "processed_pages": 1,
+                    "pages": [{"page": 1, "json": page, "markdown": markdown}],
+                    "combined_markdown": markdown,
+                }
+            )
+        )
+    finally:
+        upload_path.unlink(missing_ok=True)
 
 
-@router.post(
-    "/parse/pdf",
-    response_model=ParseResponse,
-    response_model_exclude_none=True,
-    responses={
-        200: {
-            "content": {
-                "text/markdown": {"schema": {"type": "string"}},
-            }
-        }
-    },
-)
+@router.post("/parse/pdf", status_code=202)
 async def parse_pdf(
     file: Annotated[UploadFile, File(...)],
     settings: Annotated[Settings, Depends(get_settings)],
-    ocr_service: Annotated[PaddleOCRVLService, Depends(get_ocr_service)],
+    store: Annotated[JobStore, Depends(get_job_store)],
+    owner_id: Annotated[str, Depends(get_owner_id)],
     output_format: Annotated[
-        OutputFormat,
-        Query(description="Result content to include"),
+        OutputFormat, Query(description="Artifact(s) to create")
     ] = OutputFormat.BOTH,
-) -> Response:
+) -> JSONResponse:
     extension = validate_upload(file)
     if extension != ".pdf":
         raise HTTPException(415, "This endpoint accepts PDF files only")
-    return await _parse_document(file, settings, ocr_service, output_format, extension)
+    upload_path = settings.upload_dir / f"{uuid.uuid4().hex}.pdf"
+    try:
+        await save_upload(file, upload_path, settings.max_file_size_bytes)
+        try:
+            page_count = await run_in_threadpool(
+                inspect_pdf, upload_path, settings.max_pages
+            )
+        except (EncryptedPDFError, InvalidPDFError) as exc:
+            raise HTTPException(400, str(exc)) from exc
+        try:
+            job = store.create_job(
+                owner_id=owner_id,
+                filename=file.filename or "document.pdf",
+                output_format=output_format.value,
+                total_pages=page_count,
+                upload_path=upload_path,
+            )
+        except QueueFullError as exc:
+            raise HTTPException(
+                429, "PDF job queue is full", headers={"Retry-After": "60"}
+            ) from exc
+    except Exception:
+        upload_path.unlink(missing_ok=True)
+        raise
+    return JSONResponse(_submission(job), status_code=202)
+
+
+@router.get("/jobs/{job_id}")
+def job_status(
+    job_id: str,
+    store: Annotated[JobStore, Depends(get_job_store)],
+    owner_id: Annotated[str, Depends(get_owner_id)],
+) -> dict[str, Any]:
+    return _public_job(_owned_job(store, job_id, owner_id))
+
+
+@router.get("/jobs/{job_id}/result/{artifact}")
+def job_result(
+    job_id: str,
+    artifact: str,
+    store: Annotated[JobStore, Depends(get_job_store)],
+    owner_id: Annotated[str, Depends(get_owner_id)],
+) -> FileResponse:
+    if artifact not in {"json", "markdown"}:
+        raise HTTPException(404, "Unknown result artifact")
+    job = _owned_job(store, job_id, owner_id)
+    if artifact not in _result_urls(job["id"], job["output_format"]):
+        raise HTTPException(404, "Artifact was not requested")
+    if job["status"] != "completed":
+        raise HTTPException(409, f"Job is {job['status']}")
+    path = Path(job["json_path"] if artifact == "json" else job["markdown_path"])
+    if not path.is_file():
+        raise HTTPException(409, "Result artifact is not ready")
+    return FileResponse(
+        path,
+        media_type="application/json" if artifact == "json" else "text/markdown",
+        filename=f"{job_id}.{'json' if artifact == 'json' else 'md'}",
+    )
+
+
+@router.delete("/jobs/{job_id}", status_code=202)
+def cancel_job(
+    job_id: str,
+    store: Annotated[JobStore, Depends(get_job_store)],
+    owner_id: Annotated[str, Depends(get_owner_id)],
+) -> JSONResponse:
+    job = store.cancel(job_id, owner_id)
+    if job is None:
+        raise HTTPException(404, "Job not found")
+    return JSONResponse(_public_job(job), status_code=202)
+
+
+def _owned_job(store: JobStore, job_id: str, owner_id: str) -> dict[str, Any]:
+    job = store.get(job_id, owner_id)
+    if job is None:
+        raise HTTPException(404, "Job not found")
+    return job
+
+
+def _submission(job: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "job_id": job["id"],
+        "status": job["status"],
+        "status_url": f"/jobs/{job['id']}",
+        "result_urls": _result_urls(job["id"], job["output_format"]),
+    }
+
+
+def _public_job(job: dict[str, Any]) -> dict[str, Any]:
+    return {
+        **_submission(job),
+        "filename": job["filename"],
+        "created_at": job["created_at"],
+        "updated_at": job["updated_at"],
+        "completed_at": job["completed_at"],
+        "total_pages": job["total_pages"],
+        "pending_pages": job["pending_pages"],
+        "running_pages": job["running_pages"],
+        "completed_pages": job["completed_pages"],
+        "failed_pages": job["failed_pages"],
+        "cancellation_requested": job["cancellation_requested"],
+        "retry_count": job["retry_count"],
+        "error": job["error_summary"],
+    }
+
+
+def _result_urls(job_id: str, output_format: str) -> dict[str, str]:
+    result: dict[str, str] = {}
+    if output_format in {"json", "both"}:
+        result["json"] = f"/jobs/{job_id}/result/json"
+    if output_format in {"markdown", "both"}:
+        result["markdown"] = f"/jobs/{job_id}/result/markdown"
+    return result

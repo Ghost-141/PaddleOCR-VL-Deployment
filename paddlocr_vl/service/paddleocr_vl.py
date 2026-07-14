@@ -1,134 +1,105 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import base64
 import json
 from pathlib import Path
-import threading
+import socket
 from typing import Any
-
-from paddleocr import PaddleOCRVL
+from urllib import error, request
 
 from ..core.config import Settings
-from ..utils.markdown_assembler import assemble_page_markdown
 
 
-class PaddleOCRVLService:
+class TritonError(RuntimeError):
+    def __init__(self, message: str, *, transient: bool = True) -> None:
+        super().__init__(message)
+        self.transient = transient
+
+
+class TritonClient:
     def __init__(self, settings: Settings) -> None:
-        self.settings = settings
-        self._inflight = threading.BoundedSemaphore(
-            max(1, self.settings.vl_rec_max_concurrency)
-        )
-        self._pipeline: PaddleOCRVL | None = None
-
-    @property
-    def loaded(self) -> bool:
-        return self._pipeline is not None
-
-    def start(self) -> None:
-        if (
-            self.settings.layout_model_dir is not None
-            and not self.settings.layout_model_dir.is_dir()
-        ):
-            raise RuntimeError(
-                f"Layout model directory does not exist: "
-                f"{self.settings.layout_model_dir}. Run the model setup step first."
-            )
-        self._pipeline = PaddleOCRVL(
-            device=self.settings.device,
-            pipeline_version=self.settings.pipeline_version,
-            vl_rec_backend="vllm-server",
-            vl_rec_server_url=self.settings.vllm_server_url,
-            vl_rec_api_model_name=self.settings.vllm_model_name,
-            vl_rec_api_key=self.settings.vllm_api_key,
-            vl_rec_max_concurrency=self.settings.vl_rec_max_concurrency,
-            layout_detection_model_name=self.settings.layout_model_name,
-            layout_detection_model_dir=(
-                str(self.settings.layout_model_dir)
-                if self.settings.layout_model_dir is not None
-                else None
-            ),
-            format_block_content=self.settings.format_block_content,
-            merge_layout_blocks=self.settings.merge_layout_blocks,
+        self.url = (
+            f"{settings.triton_url}/v2/models/{settings.triton_model}/infer"
         )
 
-    def stop(self) -> None:
-        self._pipeline = None
+    def infer(self, image_path: Path, *, timeout: int = 600) -> dict[str, Any]:
+        pipeline_input = json.dumps(
+            {
+                "file": base64.b64encode(image_path.read_bytes()).decode("ascii"),
+                "fileType": 1,
+                "returnMarkdownImages": False,
+                "visualize": False,
+                "restructurePages": False,
+            },
+            separators=(",", ":"),
+        )
+        body = json.dumps(
+            {
+                "inputs": [
+                    {
+                        "name": "input",
+                        "shape": [1, 1],
+                        "datatype": "BYTES",
+                        "data": [pipeline_input],
+                    }
+                ],
+                "outputs": [{"name": "output"}],
+            }
+        ).encode()
+        try:
+            with request.urlopen(
+                request.Request(
+                    self.url,
+                    data=body,
+                    headers={"Content-Type": "application/json"},
+                ),
+                timeout=timeout,
+            ) as response:
+                raw = json.load(response)
+        except error.HTTPError as exc:
+            detail = exc.read().decode(errors="replace")[:1000]
+            raise TritonError(
+                f"Triton returned HTTP {exc.code}: {detail}",
+                transient=exc.code >= 500 or exc.code == 429,
+            ) from exc
+        except (error.URLError, TimeoutError, socket.timeout, OSError) as exc:
+            raise TritonError(f"Triton request failed: {exc}") from exc
+        except (ValueError, TypeError) as exc:
+            raise TritonError(f"Invalid Triton response: {exc}", transient=False) from exc
 
-    def predict(self, input_path: Path, output_dir: Path) -> dict[str, Any]:
-        if self._pipeline is None:
-            raise RuntimeError("PaddleOCR-VL pipeline is not initialized")
-        output_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            output = json.loads(raw["outputs"][0]["data"][0])
+            if output.get("errorCode", 0):
+                raise TritonError(str(output.get("errorMsg", "pipeline error")))
+            page = output["result"]["layoutParsingResults"][0]
+            compact = page.get("prunedResult", page)
+            if not isinstance(compact, dict):
+                raise TypeError("page result is not an object")
+            return _without_images(compact)
+        except TritonError:
+            raise
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            raise TritonError(f"Invalid pipeline response: {exc}", transient=False) from exc
 
-        with self._inflight:
-            results = list(self._pipeline.predict(str(input_path)))
-        # Semaphore released — GPU slot is free for the next request.
-        # Everything below is CPU + disk I/O.
+    def ready(self, *, timeout: int = 3) -> bool:
+        try:
+            with request.urlopen(
+                self.url.rsplit("/models/", 1)[0] + "/health/ready", timeout=timeout
+            ) as response:
+                return response.status == 200
+        except OSError:
+            return False
 
-        results = results[: self.settings.max_pages]
-        if (
-            input_path.suffix.lower() == ".pdf"
-            and len(results) > 1
-            and self.settings.restructure_pages
-        ):
-            restructure_pages = getattr(self._pipeline, "restructure_pages", None)
-            if not callable(restructure_pages):
-                raise RuntimeError(
-                    "The installed PaddleOCR version does not support "
-                    "multi-page restructuring"
-                )
-            results = list(
-                restructure_pages(
-                    results,
-                    merge_tables=self.settings.merge_cross_page_tables,
-                    relevel_titles=self.settings.relevel_titles,
-                    concatenate_pages=self.settings.concatenate_pages,
-                )
-            )
 
-        page_markdowns: list[str] = [None] * len(results)  # type: ignore[list-item]
-        page_jsons: list[dict[str, Any]] = [None] * len(results)  # type: ignore[list-item]
-
-        def _process_page(index: int, result: Any) -> tuple[int, dict[str, Any], str]:
-            page_json = result.json
-            if isinstance(page_json, str):
-                page_json = json.loads(page_json)
-            if not isinstance(page_json, dict):
-                raise RuntimeError(
-                    "PaddleOCR returned an invalid in-memory JSON result"
-                )
-            page_markdown = assemble_page_markdown(page_json)
-            markdown_path = output_dir / f"page_{index}.md"
-            markdown_path.write_text(page_markdown + "\n", encoding="utf-8")
-            return index, page_json, page_markdown
-
-        max_workers = min(len(results), 8)
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = [
-                pool.submit(_process_page, idx, res)
-                for idx, res in enumerate(results, start=1)
-            ]
-            for future in as_completed(futures):
-                idx, page_json, page_markdown = future.result()
-                page_jsons[idx - 1] = page_json
-                page_markdowns[idx - 1] = page_markdown
-
-        pages = [
-            {"page": i + 1, "json": page_jsons[i], "markdown": page_markdowns[i]}
-            for i in range(len(results))
-        ]
-
-        non_empty_pages = [
-            (page, md)
-            for page, md in enumerate(page_markdowns, start=1)
-            if md and md.strip()
-        ]
-        combined = "\n\n".join(
-            md if position == 0 else f"---\n\n_Page {page}_\n\n{md}"
-            for position, (page, md) in enumerate(non_empty_pages)
-        ).strip()
-
+def _without_images(value: Any) -> Any:
+    if isinstance(value, dict):
         return {
-            "processed_pages": len(pages),
-            "pages": pages,
-            "combined_markdown": combined,
+            key: _without_images(item)
+            for key, item in value.items()
+            if key not in {"outputImages", "inputImage", "images", "img"}
         }
+    if isinstance(value, list):
+        return [_without_images(item) for item in value]
+    if isinstance(value, str) and value.startswith("data:image/"):
+        return ""
+    return value

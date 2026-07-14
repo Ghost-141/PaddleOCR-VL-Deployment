@@ -5,9 +5,9 @@ export HF_HUB_DISABLE_XET="1"
 export HF_HUB_DOWNLOAD_TIMEOUT="900"
 export HF_HUB_ETAG_TIMEOUT="300"
 
-repository="PaddlePaddle/PP-DocLayoutV2"
-revision="b73668227b14316a38f8b345d6b474e4f1f0b84d"
-destination="/models/PP-DocLayoutV2"
+repository="PaddlePaddle/PP-DocLayoutV3"
+revision="7b48a7566925fa464281f930c58eee04fe2c862a"
+destination="/models/PP-DocLayoutV3"
 attempts=10
 workers=1
 
@@ -20,7 +20,7 @@ for attempt in $(seq 1 "${attempts}"); do
         --local-dir "${destination}" \
         --max-workers "${workers}"; then
         missing=0
-        for filename in config.json inference.json inference.pdiparams inference.yml; do
+        for filename in inference.json inference.pdiparams inference.yml; do
             if [[ ! -f "${destination}/${filename}" ]]; then
                 echo "Missing required model file: ${filename}" >&2
                 missing=1

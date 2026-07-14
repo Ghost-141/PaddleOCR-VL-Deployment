@@ -1,5 +1,5 @@
-"""Vision-language provider integrations."""
+"""Triton provider integration."""
 
-from .paddleocr_vl import PaddleOCRVLService
+from .paddleocr_vl import TritonClient, TritonError
 
-__all__ = ["PaddleOCRVLService"]
+__all__ = ["TritonClient", "TritonError"]

@@ -8,10 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 class HealthResponse(BaseModel):
     status: str
-    pipeline_loaded: bool
-    vllm_server_url: str
-    vllm_model: str
-    layout_model: str
+    triton_url: str
 
 
 class PageResult(BaseModel):
@@ -34,5 +31,5 @@ class ParseResponse(BaseModel):
     content_type: str | None
     file_size_bytes: int
     processed_pages: int
-    pages: list[PageResult] | None = None
-    combined_markdown: str | None = None
+    pages: list[PageResult]
+    combined_markdown: str

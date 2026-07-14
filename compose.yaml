@@ -2,21 +2,22 @@ name: paddleocr-vl
 
 services:
   model-setup:
-    build:
-      context: .
-      args:
-        PADDLEOCR_IMAGE: ${API_BASE_IMAGE:-ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddleocr-vl:latest-nvidia-gpu-offline}
+    build: .
     user: root
     environment:
       HF_TOKEN: ${HF_TOKEN:-}
+      HPS_SERVER_DIR: /hps-server
+      LAYOUT_DEVICE: ${LAYOUT_DEVICE:-cpu}
+      LAYOUT_INSTANCE_COUNT: ${LAYOUT_INSTANCE_COUNT:-}
+      VL_MAX_CONCURRENCY: ${VL_MAX_CONCURRENCY:-2}
     volumes:
-      - ./models:/models
+      - models:/models
+      - hps-server:/hps-server
       - huggingface-cache:/root/.cache
-    command: ["bash", "/app/scripts/download_models.sh"]
+    command: ["bash", "-lc", "bash /app/scripts/download_models.sh && python /app/scripts/prepare_hps.py"]
 
   paddleocr-vlm-server:
     image: ${VLLM_IMAGE:-ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddleocr-genai-vllm-server:latest-nvidia-gpu-offline}
-    user: root
     command:
       - paddleocr
       - genai_server
@@ -32,9 +33,6 @@ services:
       - /opt/paddleocr/vllm_config.yaml
     volumes:
       - ./deploy/vllm_config.yaml:/opt/paddleocr/vllm_config.yaml:ro
-    environment:
-      PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK: "True"
-    shm_size: 8gb
     restart: unless-stopped
     deploy:
       resources:
@@ -50,30 +48,18 @@ services:
       timeout: 5s
       retries: 10
 
-  api:
-    build:
-      context: .
-      args:
-        PADDLEOCR_IMAGE: ${API_BASE_IMAGE:-ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddleocr-vl:latest-nvidia-gpu-offline}
-    ports:
-      - "${APP_PORT:-8080}:8080"
+  triton:
+    image: ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlex/hps:paddlex3.7-${LAYOUT_DEVICE:-cpu}
+    working_dir: /app
     environment:
-      PUBLIC_API_KEY: ${PUBLIC_API_KEY:?Set PUBLIC_API_KEY in .env}
-      PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK: "True"
-      VLLM_API_KEY: ${VLLM_API_KEY:-EMPTY}
-      DEVICE: ${DEVICE:-gpu:0}
-      MAX_FILE_SIZE_MB: ${MAX_FILE_SIZE_MB:-100}
-      MAX_PAGES: ${MAX_PAGES:-100}
+      PADDLEX_HPS_DEVICE_TYPE: ${LAYOUT_DEVICE:-cpu}
+      PADDLEX_HPS_USE_HPIP: ${PADDLEX_HPS_USE_HPIP:-0}
     volumes:
-      - app-data:/data
-      - ./models:/models:ro
+      - hps-server:/app
+      - models:/models:ro
+    command: ["/bin/bash", "server.sh"]
     shm_size: 8gb
     restart: unless-stopped
-    depends_on:
-      model-setup:
-        condition: service_completed_successfully
-      paddleocr-vlm-server:
-        condition: service_healthy
     deploy:
       resources:
         reservations:
@@ -81,13 +67,61 @@ services:
             - driver: nvidia
               device_ids: ["${GPU_DEVICE_ID:-0}"]
               capabilities: [gpu]
+    depends_on:
+      model-setup:
+        condition: service_completed_successfully
+      paddleocr-vlm-server:
+        condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health || exit 1"]
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8000/v2/health/ready', timeout=4).close()"
       start_period: 5m
       interval: 15s
       timeout: 5s
       retries: 10
 
+  api:
+    build: .
+    ports:
+      - "${APP_PORT:-8080}:8080"
+    environment: &app-environment
+      PUBLIC_API_KEY: ${PUBLIC_API_KEY:?Set PUBLIC_API_KEY in .env}
+      TRITON_URL: http://triton:8000
+      DATA_DIR: /data
+      MAX_FILE_SIZE_MB: ${MAX_FILE_SIZE_MB:-100}
+      MAX_PAGES: ${MAX_PAGES:-100}
+      MAX_JOBS: ${MAX_JOBS:-20}
+      RETENTION_HOURS: ${RETENTION_HOURS:-24}
+    volumes:
+      - app-data:/data
+    restart: unless-stopped
+    depends_on:
+      triton:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+
+  worker:
+    build: .
+    command: ["python", "-m", "paddlocr_vl.worker"]
+    environment: *app-environment
+    volumes:
+      - app-data:/data
+    restart: unless-stopped
+    depends_on:
+      triton:
+        condition: service_healthy
+    deploy:
+      replicas: 4
+
 volumes:
   app-data:
+  hps-server:
+  models:
   huggingface-cache:

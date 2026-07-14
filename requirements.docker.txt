@@ -1,8 +1,7 @@
-# Application-owned HTTP/runtime dependencies. PaddleOCR, PaddlePaddle, and
-# CUDA remain provided by the official PaddleOCR GPU base image.
 fastapi==0.139.0
 huggingface-hub==1.23.0
+Pillow==11.3.0
+pypdfium2==4.30.0
 python-dotenv==1.2.2
 python-multipart==0.0.32
-safetensors==0.5.3
 uvicorn==0.51.0

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import secrets
 from typing import Annotated
 
@@ -7,7 +8,8 @@ from fastapi import HTTPException, Request, Security
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from .config import Settings
-from ..service import PaddleOCRVLService
+from ..jobs import JobStore
+from ..service import TritonClient
 
 bearer_scheme = HTTPBearer(scheme_name="Bearer Authentication")
 
@@ -16,8 +18,16 @@ def get_settings(request: Request) -> Settings:
     return request.app.state.settings
 
 
-def get_ocr_service(request: Request) -> PaddleOCRVLService:
-    return request.app.state.ocr_service
+def get_job_store(request: Request) -> JobStore:
+    return request.app.state.job_store
+
+
+def get_triton_client(request: Request) -> TritonClient:
+    return request.app.state.triton_client
+
+
+def get_owner_id(request: Request) -> str:
+    return request.state.owner_id
 
 
 def authorize(
@@ -25,11 +35,11 @@ def authorize(
     credentials: Annotated[HTTPAuthorizationCredentials, Security(bearer_scheme)],
 ) -> None:
     settings = get_settings(request)
-    if not secrets.compare_digest(
-        credentials.credentials.strip(), settings.public_api_key
-    ):
+    token = credentials.credentials.strip()
+    if not secrets.compare_digest(token, settings.public_api_key):
         raise HTTPException(
             401,
             "Invalid public API key",
             headers={"WWW-Authenticate": "Bearer"},
         )
+    request.state.owner_id = hashlib.sha256(token.encode()).hexdigest()

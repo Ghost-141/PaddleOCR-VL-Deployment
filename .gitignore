@@ -45,8 +45,10 @@ model-cache/
 *.swo
 .DS_Store
 Thumbs.db
+*.pdf
 
 # Local agent configuration
 .agents/
 .codex/
+graphify-out
 
