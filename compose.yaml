@@ -6,15 +6,10 @@ services:
     user: root
     environment:
       HF_TOKEN: ${HF_TOKEN:-}
-      HPS_SERVER_DIR: /hps-server
-      LAYOUT_DEVICE: ${LAYOUT_DEVICE:-cpu}
-      LAYOUT_INSTANCE_COUNT: ${LAYOUT_INSTANCE_COUNT:-}
-      VL_MAX_CONCURRENCY: ${VL_MAX_CONCURRENCY:-2}
     volumes:
       - models:/models
-      - hps-server:/hps-server
       - huggingface-cache:/root/.cache
-    command: ["bash", "-lc", "bash /app/scripts/download_models.sh && python /app/scripts/prepare_hps.py"]
+    command: ["bash", "/app/scripts/download_models.sh"]
 
   paddleocr-vlm-server:
     image: ${VLLM_IMAGE:-ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddleocr-genai-vllm-server:latest-nvidia-gpu-offline}
@@ -55,7 +50,7 @@ services:
       PADDLEX_HPS_DEVICE_TYPE: ${LAYOUT_DEVICE:-cpu}
       PADDLEX_HPS_USE_HPIP: ${PADDLEX_HPS_USE_HPIP:-0}
     volumes:
-      - hps-server:/app
+      - ./deploy/hps/server:/app:ro
       - models:/models:ro
     command: ["/bin/bash", "server.sh"]
     shm_size: 8gb
@@ -94,6 +89,8 @@ services:
       MAX_FILE_SIZE_MB: ${MAX_FILE_SIZE_MB:-100}
       MAX_PAGES: ${MAX_PAGES:-100}
       MAX_JOBS: ${MAX_JOBS:-20}
+      LEASE_SECONDS: ${LEASE_SECONDS:-900}
+      MAX_RETRIES: ${MAX_RETRIES:-3}
       RETENTION_HOURS: ${RETENTION_HOURS:-24}
     volumes:
       - app-data:/data
@@ -122,6 +119,5 @@ services:
 
 volumes:
   app-data:
-  hps-server:
   models:
   huggingface-cache:
