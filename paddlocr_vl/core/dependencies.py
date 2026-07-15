@@ -8,8 +8,8 @@ from fastapi import HTTPException, Request, Security
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from .config import Settings
-from ..jobs import JobStore
-from ..service import TritonClient
+from ..db.jobs import JobStore
+from ..service import VllmClient
 
 bearer_scheme = HTTPBearer(scheme_name="Bearer Authentication")
 
@@ -22,8 +22,8 @@ def get_job_store(request: Request) -> JobStore:
     return request.app.state.job_store
 
 
-def get_triton_client(request: Request) -> TritonClient:
-    return request.app.state.triton_client
+def get_vllm_client(request: Request) -> VllmClient:
+    return request.app.state.vllm_client
 
 
 def get_owner_id(request: Request) -> str:

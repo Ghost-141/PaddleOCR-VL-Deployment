@@ -105,7 +105,7 @@ services:
 
   layout-worker:
     build: .
-    command: ["python", "-m", "paddlocr_vl.layout_worker"]
+    command: ["python", "-m", "paddlocr_vl.workers.layout"]
     environment: *app-environment
     volumes:
       - app-data:/data
@@ -118,7 +118,7 @@ services:
 
   vlm-worker:
     build: .
-    command: ["python", "-m", "paddlocr_vl.vlm_worker"]
+    command: ["python", "-m", "paddlocr_vl.workers.vlm"]
     environment: *app-environment
     volumes:
       - app-data:/data

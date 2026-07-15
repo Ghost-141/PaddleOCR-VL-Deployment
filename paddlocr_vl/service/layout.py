@@ -7,7 +7,12 @@ from typing import Any
 from urllib import error, request
 
 from ..core.config import Settings
-from .paddleocr_vl import TritonError
+
+
+class LayoutError(RuntimeError):
+    def __init__(self, message: str, *, transient: bool = True) -> None:
+        super().__init__(message)
+        self.transient = transient
 
 
 class LayoutClient:
@@ -25,16 +30,16 @@ class LayoutClient:
             ) as response:
                 payload = json.load(response)
         except error.HTTPError as exc:
-            raise TritonError(
+            raise LayoutError(
                 f"Layout returned HTTP {exc.code}: {exc.read().decode(errors='replace')[:500]}",
                 transient=exc.code >= 500 or exc.code == 429,
             ) from exc
         except (error.URLError, TimeoutError, socket.timeout, OSError) as exc:
-            raise TritonError(f"Layout request failed: {exc}") from exc
+            raise LayoutError(f"Layout request failed: {exc}") from exc
         try:
             boxes = payload["res"]["boxes"]
             if not isinstance(boxes, list):
                 raise TypeError("boxes is not a list")
             return [box for box in boxes if isinstance(box, dict)]
         except (KeyError, TypeError) as exc:
-            raise TritonError(f"Invalid layout response: {exc}", transient=False) from exc
+            raise LayoutError(f"Invalid layout response: {exc}", transient=False) from exc

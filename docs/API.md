@@ -1,289 +1,662 @@
 # PaddleOCR-VL API Reference
 
-This guide describes how to query the running PaddleOCR-VL API. The API accepts
-one image or one PDF per request and always returns JSON. PDF requests can
-include structured PaddleOCR results, assembled Markdown, or both.
+Production contract for API version `2.0.0`.
 
-## Base URL
+## Conventions
 
-For a local deployment using the default `APP_PORT=8080`:
+| Item | Value |
+|---|---|
+| Default base URL | `http://localhost:8080` |
+| Request encoding | JSON unless an endpoint specifies `multipart/form-data` |
+| Response encoding | JSON unless a result endpoint specifies otherwise |
+| Authentication | `Authorization: Bearer <PUBLIC_API_KEY>` |
+| Job identifier | 32-character lowercase UUID hex string |
+| Timestamp format | Unix time in seconds, represented as a JSON number |
+
+`status_url` and `result_urls` are relative paths. Resolve them against the same
+base URL used to submit the job.
+
+The API does not implement an idempotency key. Every successful PDF submission
+creates a new job, even when the file and request parameters are identical.
+
+FastAPI also exposes generated API discovery documents:
+
+- Swagger UI: `/docs`
+- ReDoc: `/redoc`
+- OpenAPI schema: `/openapi.json`
+
+## Authentication and ownership
+
+Every endpoint except `GET /health` requires a bearer token:
+
+```http
+Authorization: Bearer your-api-key
+```
+
+Jobs are scoped to a SHA-256 identity derived from the bearer token. A request
+using a different token receives `404 Job not found`, even when the job ID
+exists. The default deployment has one `PUBLIC_API_KEY`, so it is a shared
+on-premises credential rather than per-employee identity.
+
+Missing or invalid credentials return `401`:
+
+```json
+{
+  "detail": "Invalid public API key"
+}
+```
+
+An invalid-token response includes:
+
+```http
+WWW-Authenticate: Bearer
+```
+
+## Endpoint summary
+
+| Method | Path | Authentication | Success | Purpose |
+|---|---|---|---:|---|
+| `GET` | `/health` | No | `200` | Gateway liveness |
+| `POST` | `/parse/image` | Bearer | `200` | Parse one image synchronously |
+| `POST` | `/parse/pdf` | Bearer | `202` | Validate and queue a PDF |
+| `GET` | `/jobs/{job_id}` | Bearer | `200` | Read job status and progress |
+| `GET` | `/jobs/{job_id}/result/{artifact}` | Bearer | `200` | Download a completed artifact |
+| `DELETE` | `/jobs/{job_id}` | Bearer | `202` | Request cancellation |
+
+---
+
+## `GET /health`
+
+Reports that the FastAPI gateway started successfully and shows its configured
+internal vLLM URL.
+
+This endpoint does **not** probe vLLM. Use it as gateway liveness, not
+end-to-end backend readiness.
+
+### Request
+
+No parameters or authentication.
 
 ```bash
-export OCR_API_URL="http://localhost:8080"
-export OCR_API_KEY="value-of-PUBLIC_API_KEY"
+curl --fail-with-body http://localhost:8080/health
 ```
 
-For a public deployment, use its HTTPS origin instead:
-
-```bash
-export OCR_API_URL="https://ocr.example.com"
-export OCR_API_KEY="value-of-PUBLIC_API_KEY"
-```
-
-Do not add a trailing slash to `OCR_API_URL` in these examples.
-
-## Authentication
-
-The image and PDF endpoints require the public API key as a bearer token:
-
-```text
-Authorization: Bearer <PUBLIC_API_KEY>
-```
-
-The `/health` endpoint does not require authentication. Keep the API key out of
-source control, URLs, query strings, and application logs.
-
-## Request Limits
-
-| Setting | Default | Behavior |
-| --- | ---: | --- |
-| `MAX_FILE_SIZE_MB` | `100` | Rejects a larger upload with HTTP 413 |
-| `MAX_PAGES` | `100` | Limits the PDF page results returned and assembled |
-
-`MAX_FILE_SIZE_MB` is measured in MiB (`1 MiB = 1,048,576 bytes`). The current
-pipeline applies `MAX_PAGES` after PaddleOCR prediction, so it limits the
-response but does not stop initial PDF inference early. Long or visually
-complex documents can take several minutes; configure client and reverse-proxy
-timeouts accordingly.
-
-## Health Check
-
-### `GET /health`
-
-Checks whether the API process and PaddleOCR pipeline are ready. Authentication
-is not required.
-
-```bash
-curl --fail-with-body "$OCR_API_URL/health"
-```
-
-Example response:
+### `200 OK`
 
 ```json
 {
   "status": "healthy",
-  "pipeline_loaded": true,
-  "vllm_server_url": "http://paddleocr-vlm-server:8118/v1",
-  "vllm_model": "PaddleOCR-VL-1.6-0.9B",
-  "layout_model": "PP-DocLayoutV2"
+  "vllm_url": "http://paddleocr-vlm-server:8118/v1"
 }
 ```
 
-`status` is `healthy` when the pipeline is loaded and `starting` otherwise.
+| Field | Type | Description |
+|---|---|---|
+| `status` | string | Gateway state; currently `healthy` after successful startup |
+| `vllm_url` | string | Internal vLLM base URL configured for the gateway |
 
-## Parse an Image
+---
 
-### `POST /parse/image`
+## `POST /parse/image`
 
-Processes exactly one image and returns structured page JSON plus clean
-Markdown. This endpoint has no query parameters.
+Parses one image synchronously. The HTTP request remains open until vLLM
+returns the page result or the backend request fails.
 
-| Parameter | Location | Type | Required | Description |
-| --- | --- | --- | --- | --- |
-| `file` | Multipart form | File | Yes | PNG, JPEG, WebP, or TIFF image |
+The server-side vLLM request timeout is 600 seconds. Clients and upstream
+proxies must allow enough time for synchronous image processing or use the
+asynchronous PDF workflow for multi-page documents.
 
-Supported extensions are `.png`, `.jpg`, `.jpeg`, `.webp`, `.tif`, and
-`.tiff`. Accepted MIME types are `image/png`, `image/jpeg`, `image/jpg`,
-`image/webp`, `image/tiff`, and `application/octet-stream`.
+### Request
 
-```bash
-curl --fail-with-body \
-  --request POST \
-  "$OCR_API_URL/parse/image" \
-  --header "Authorization: Bearer $OCR_API_KEY" \
-  --form "file=@page.png" \
-  --output image-response.json
+Content type: `multipart/form-data`
+
+| Field | Location | Type | Required | Description |
+|---|---|---|---|---|
+| `file` | form body | binary | Yes | One PNG, JPEG, WebP, or TIFF image |
+
+Accepted filename extensions:
+
+```text
+.png .jpg .jpeg .webp .tif .tiff
 ```
 
-Example response shape:
+Accepted media types are `image/png`, `image/jpeg`, `image/jpg`, `image/webp`,
+`image/tiff`, and `application/octet-stream`. The filename must have a supported
+extension. Maximum upload size is controlled by `MAX_FILE_SIZE_MB`.
+
+```bash
+curl --fail-with-body -X POST http://localhost:8080/parse/image \
+  -H "Authorization: Bearer $OCR_API_KEY" \
+  -F file=@page.png
+```
+
+### `200 OK`
+
+Content type: `application/json`
 
 ```json
 {
-  "request_id": "dd5427dfcb314211952ad143974e7aec",
+  "request_id": "2a60ce2be68a48f29545725fd5ef22db",
   "filename": "page.png",
   "content_type": "image/png",
-  "file_size_bytes": 84231,
+  "file_size_bytes": 184233,
   "processed_pages": 1,
   "pages": [
     {
       "page": 1,
       "json": {
-        "parsing_res_list": []
+        "parsing_res_list": [
+          {
+            "block_label": "text",
+            "block_content": "Parsed document text"
+          }
+        ]
       },
-      "markdown": "# Document title\n\nDocument text."
+      "markdown": "Parsed document text"
     }
   ],
-  "combined_markdown": "# Document title\n\nDocument text."
+  "combined_markdown": "Parsed document text"
 }
 ```
 
-Extract the assembled Markdown with `jq`:
+| Field | Type | Nullable | Description |
+|---|---|---:|---|
+| `request_id` | string | No | Unique 32-character request identifier |
+| `filename` | string | Yes | Multipart filename supplied by the client |
+| `content_type` | string | Yes | Multipart media type supplied by the client |
+| `file_size_bytes` | integer | No | Number of uploaded bytes |
+| `processed_pages` | integer | No | Always `1` for this endpoint |
+| `pages` | array | No | One page result |
+| `pages[].page` | integer | No | One-based page number; always `1` |
+| `pages[].json` | object | No | Compact PaddleOCR-VL structured page result |
+| `pages[].markdown` | string | No | Markdown assembled from the structured blocks |
+| `combined_markdown` | string | No | Same value as page-one Markdown |
 
-```bash
-jq --raw-output '.combined_markdown' image-response.json > image-output.md
+The contents of `pages[].json` are model-defined and may gain fields when the
+pinned PaddleOCR-VL SDK is upgraded. The API removes embedded images and Base64
+image data before returning it.
+
+### Errors
+
+| Status | Condition |
+|---:|---|
+| `401` | Bearer token is missing or invalid |
+| `413` | File exceeds `MAX_FILE_SIZE_MB` |
+| `415` | Filename extension or media type is unsupported, or a PDF was submitted |
+| `422` | Multipart field `file` is missing |
+| `502` | Triton/vLLM inference failed or returned an invalid response |
+
+Example backend failure:
+
+```json
+{
+  "detail": "Document parsing failed: Triton request failed: ..."
+}
 ```
 
-Multiple images must be sent as separate requests.
+---
 
-## Parse a PDF
+## `POST /parse/pdf`
 
-### `POST /parse/pdf`
+Streams a PDF to durable storage, validates it, creates one page task per page,
+and returns immediately with `202 Accepted`. Processing continues in background
+workers.
 
-Processes one single-page or multi-page PDF.
+### Request
+
+Content type: `multipart/form-data`
 
 | Parameter | Location | Type | Required | Default | Description |
-| --- | --- | --- | --- | --- | --- |
-| `file` | Multipart form | File | Yes | None | PDF document |
-| `output_format` | Query string | Enum | No | `both` | `json`, `markdown`, or `both` |
+|---|---|---|---|---|---|
+| `file` | form body | binary | Yes | — | PDF upload |
+| `output_format` | query | enum | No | `both` | Artifact selection: `json`, `markdown`, or `both` |
 
-The filename must end in `.pdf`. Accepted MIME types are `application/pdf` and
-`application/octet-stream`.
+The filename must end in `.pdf`. Accepted media types are `application/pdf` and
+`application/octet-stream`. Before queueing, the API rejects files that are:
 
-### JSON and Markdown
+- larger than `MAX_FILE_SIZE_MB`;
+- encrypted or password protected;
+- corrupt or not readable as PDF;
+- empty;
+- over the configured `MAX_PAGES` limit.
 
-Omitting `output_format` is equivalent to `output_format=both`:
-
-```bash
-curl --fail-with-body \
-  --request POST \
-  "$OCR_API_URL/parse/pdf?output_format=both" \
-  --header "Authorization: Bearer $OCR_API_KEY" \
-  --form "file=@document.pdf" \
-  --output document-response.json
-```
-
-The response contains request metadata, `pages`, and `combined_markdown`. Each
-page contains `page`, `json`, and `markdown`.
-
-### Structured JSON Only
+Example:
 
 ```bash
-curl --fail-with-body \
-  --request POST \
-  "$OCR_API_URL/parse/pdf?output_format=json" \
-  --header "Authorization: Bearer $OCR_API_KEY" \
-  --form "file=@document.pdf" \
-  --output document-structure.json
+curl --fail-with-body -X POST \
+  'http://localhost:8080/parse/pdf?output_format=both' \
+  -H "Authorization: Bearer $OCR_API_KEY" \
+  -F file=@document.pdf
 ```
 
-The response contains `pages`, but each page contains only `page` and `json`.
-It does not contain `combined_markdown` or page-level `markdown` fields.
-
-### Markdown Only
-
-```bash
-curl --fail-with-body \
-  --request POST \
-  "$OCR_API_URL/parse/pdf?output_format=markdown" \
-  --header "Authorization: Bearer $OCR_API_KEY" \
-  --form "file=@document.pdf" \
-  --output document-markdown-response.json
-```
-
-This still returns an `application/json` response. Extract the Markdown string
-into a file:
-
-```bash
-jq --raw-output '.combined_markdown' \
-  document-markdown-response.json > document.md
-```
-
-The Markdown-only response has this shape:
+### `202 Accepted`
 
 ```json
 {
-  "request_id": "f85b73e19d9a471394637fc03a612fb1",
-  "filename": "document.pdf",
-  "content_type": "application/pdf",
-  "file_size_bytes": 524288,
-  "processed_pages": 4,
-  "combined_markdown": "# Document title\n\nDocument text."
+  "job_id": "16f86c44f021443f95df0c7af81c7f23",
+  "status": "queued",
+  "status_url": "/jobs/16f86c44f021443f95df0c7af81c7f23",
+  "result_urls": {
+    "json": "/jobs/16f86c44f021443f95df0c7af81c7f23/result/json",
+    "markdown": "/jobs/16f86c44f021443f95df0c7af81c7f23/result/markdown"
+  }
 }
 ```
-
-## Python Example
-
-This example processes a PDF and saves its assembled Markdown:
-
-```python
-import os
-from pathlib import Path
-
-import httpx
-
-base_url = os.environ["OCR_API_URL"]
-api_key = os.environ["OCR_API_KEY"]
-pdf_path = Path("document.pdf")
-
-with pdf_path.open("rb") as pdf_file:
-    response = httpx.post(
-        f"{base_url}/parse/pdf",
-        params={"output_format": "markdown"},
-        headers={"Authorization": f"Bearer {api_key}"},
-        files={"file": (pdf_path.name, pdf_file, "application/pdf")},
-        timeout=600,
-    )
-
-response.raise_for_status()
-Path("document.md").write_text(
-    response.json()["combined_markdown"],
-    encoding="utf-8",
-)
-```
-
-For an image, change the URL to `/parse/image`, remove `params`, and supply the
-appropriate image MIME type. The image endpoint always returns both formats.
-
-## Response Fields
-
-| Field | Type | Present when | Description |
-| --- | --- | --- | --- |
-| `request_id` | String | Always | Unique request identifier |
-| `filename` | String or null | Always | Original multipart filename |
-| `content_type` | String or null | Always | MIME type supplied by the client |
-| `file_size_bytes` | Integer | Always | Number of uploaded bytes |
-| `processed_pages` | Integer | Always | Number of page results returned |
-| `pages` | Array | Image, PDF `json`, or PDF `both` | Ordered page results |
-| `combined_markdown` | String | Image, PDF `markdown`, or PDF `both` | Assembled Markdown |
-
-Each item in `pages` can contain:
 
 | Field | Type | Description |
-| --- | --- | --- |
-| `page` | Integer | One-based page number |
-| `json` | Object | Raw structured PaddleOCR page result |
-| `markdown` | String | Page Markdown; included for images and PDF `both` |
+|---|---|---|
+| `job_id` | string | Durable job identifier |
+| `status` | string | Initial state, normally `queued` |
+| `status_url` | string | Relative URL for progress checks |
+| `result_urls` | object | Relative URLs for requested artifacts only |
 
-## Error Responses
+`output_format=json` exposes only `result_urls.json`; `markdown` exposes only
+`result_urls.markdown`; `both` exposes both. A URL indicates the requested
+artifact, not that it is ready.
 
-Errors use FastAPI's standard JSON shape:
+### Errors
+
+| Status | Condition |
+|---:|---|
+| `400` | PDF is corrupt, encrypted, empty, or exceeds `MAX_PAGES` |
+| `401` | Bearer token is missing or invalid |
+| `413` | Upload exceeds `MAX_FILE_SIZE_MB` |
+| `415` | Filename extension or media type is unsupported, or the file is not submitted as PDF |
+| `422` | `file` is missing or `output_format` is not `json`, `markdown`, or `both` |
+| `429` | `MAX_JOBS` queued/running jobs already exist |
+
+A queue-full response includes:
+
+```http
+Retry-After: 60
+```
 
 ```json
 {
-  "detail": "Error description"
+  "detail": "PDF job queue is full"
 }
 ```
 
-| Status | Meaning | Typical cause |
-| ---: | --- | --- |
-| `401` | Unauthorized | Missing or invalid bearer token |
-| `413` | Content too large | Upload exceeds `MAX_FILE_SIZE_MB` |
-| `415` | Unsupported media type | Unsupported file or wrong endpoint |
-| `422` | Invalid request | Missing `file` or invalid `output_format` |
-| `502` | OCR backend failure | PaddleOCR or vLLM inference failed |
+---
 
-Use `curl --fail-with-body` to preserve the JSON error body while returning a
-nonzero shell exit status.
+## `GET /jobs/{job_id}`
 
-## Interactive Specification
+Returns the current state and page-level progress counters for an owned job.
 
-FastAPI exposes Swagger documentation and its OpenAPI schema at:
+### Request
 
-```text
-GET /docs
-GET /openapi.json
+| Parameter | Location | Type | Required | Description |
+|---|---|---|---|---|
+| `job_id` | path | string | Yes | ID returned by `POST /parse/pdf` |
+
+```bash
+curl --fail-with-body \
+  -H "Authorization: Bearer $OCR_API_KEY" \
+  http://localhost:8080/jobs/16f86c44f021443f95df0c7af81c7f23
 ```
 
-For example, with the default `APP_PORT=8080`, open
-`http://localhost:8080/docs`. Replace `8080` with the configured production
-port when necessary.
+### `200 OK`
+
+```json
+{
+  "job_id": "16f86c44f021443f95df0c7af81c7f23",
+  "status": "running",
+  "status_url": "/jobs/16f86c44f021443f95df0c7af81c7f23",
+  "result_urls": {
+    "json": "/jobs/16f86c44f021443f95df0c7af81c7f23/result/json",
+    "markdown": "/jobs/16f86c44f021443f95df0c7af81c7f23/result/markdown"
+  },
+  "filename": "document.pdf",
+  "created_at": 1784017200.125,
+  "updated_at": 1784017218.702,
+  "completed_at": null,
+  "total_pages": 10,
+  "pending_pages": 6,
+  "running_pages": 2,
+  "completed_pages": 2,
+  "failed_pages": 0,
+  "cancellation_requested": false,
+  "retry_count": 1,
+  "error": null
+}
+```
+
+| Field | Type | Nullable | Description |
+|---|---|---:|---|
+| `job_id` | string | No | Durable job identifier |
+| `status` | string | No | Current lifecycle state |
+| `status_url` | string | No | Relative status URL |
+| `result_urls` | object | No | Requested artifact URLs |
+| `filename` | string | No | Original client filename |
+| `created_at` | number | No | Creation time as Unix seconds |
+| `updated_at` | number | No | Last state-change time as Unix seconds |
+| `completed_at` | number | Yes | Terminal completion time; otherwise `null` |
+| `total_pages` | integer | No | Validated PDF page count |
+| `pending_pages` | integer | No | Pages waiting to be claimed or retried |
+| `running_pages` | integer | No | Pages with active worker leases |
+| `completed_pages` | integer | No | Successfully parsed pages |
+| `failed_pages` | integer | No | Permanently failed pages |
+| `cancellation_requested` | boolean | No | Whether cancellation has been requested |
+| `retry_count` | integer | No | Number of transient backend retries scheduled |
+| `error` | string | Yes | Most recent job/page/assembly error summary |
+
+Cancelled page tasks are not exposed as a separate counter. Consequently, page
+counters do not necessarily add up to `total_pages` after cancellation.
+
+### Job states
+
+| Status | Terminal | Meaning |
+|---|---:|---|
+| `queued` | No | Pages are waiting for workers |
+| `running` | No | At least one page is running or has completed while more remain |
+| `assembling` | No | Page JSON is complete and requested artifacts are being assembled |
+| `completed` | Yes | Requested artifacts are ready |
+| `failed` | Yes | A page or artifact assembly failed permanently |
+| `cancelled` | Yes | Cancellation completed between page tasks |
+
+Typical lifecycle:
+
+```text
+queued → running → assembling → completed
+                 ↘ failed
+queued/running → cancelled
+```
+
+Clients should stop polling at `completed`, `failed`, or `cancelled`. Polling
+every one or two seconds is sufficient for the current deployment.
+
+### Errors
+
+| Status | Condition |
+|---:|---|
+| `401` | Bearer token is missing or invalid |
+| `404` | Job is unknown, expired, or owned by another token |
+
+```json
+{
+  "detail": "Job not found"
+}
+```
+
+---
+
+## `GET /jobs/{job_id}/result/{artifact}`
+
+Downloads one completed artifact. This is a raw file response, not a JSON
+wrapper.
+
+### Request
+
+| Parameter | Location | Type | Required | Values |
+|---|---|---|---|---|
+| `job_id` | path | string | Yes | ID returned at submission |
+| `artifact` | path | enum | Yes | `json` or `markdown` |
+
+### JSON result
+
+```bash
+curl --fail-with-body \
+  -H "Authorization: Bearer $OCR_API_KEY" \
+  -o result.json \
+  http://localhost:8080/jobs/16f86c44f021443f95df0c7af81c7f23/result/json
+```
+
+Response headers include:
+
+```http
+Content-Type: application/json
+Content-Disposition: attachment; filename="16f86c44f021443f95df0c7af81c7f23.json"
+```
+
+Artifact structure:
+
+```json
+{
+  "job_id": "16f86c44f021443f95df0c7af81c7f23",
+  "filename": "document.pdf",
+  "pages": [
+    {
+      "page": 1,
+      "json": {
+        "parsing_res_list": [
+          {
+            "block_label": "paragraph_title",
+            "block_content": "Introduction"
+          },
+          {
+            "block_label": "text",
+            "block_content": "First page text."
+          }
+        ]
+      }
+    }
+  ]
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `job_id` | string | Source job identifier |
+| `filename` | string | Original client filename |
+| `pages` | array | Compact page results in ascending page order |
+| `pages[].page` | integer | One-based page number |
+| `pages[].json` | object | Compact PaddleOCR-VL structured page result |
+
+Embedded and Base64 images are removed. Cross-page title levels and repeated
+table headers may be normalized during artifact assembly.
+
+### Markdown result
+
+```bash
+curl --fail-with-body \
+  -H "Authorization: Bearer $OCR_API_KEY" \
+  -o result.md \
+  http://localhost:8080/jobs/16f86c44f021443f95df0c7af81c7f23/result/markdown
+```
+
+Response headers include:
+
+```http
+Content-Type: text/markdown; charset=utf-8
+Content-Disposition: attachment; filename="16f86c44f021443f95df0c7af81c7f23.md"
+```
+
+Example artifact:
+
+```markdown
+## Page 1
+
+# Document title
+
+First page text.
+
+---
+
+## Page 2
+
+Second page text.
+
+---
+```
+
+The assembler preserves reading order from structured page blocks and handles
+headings, paragraphs, lists, tables, display formulas, and code-like blocks.
+Generated image markup is removed.
+
+### Errors
+
+| Status | Condition |
+|---:|---|
+| `401` | Bearer token is missing or invalid |
+| `404` | Job is unknown/expired, artifact is unknown, artifact was not requested, or job belongs to another token |
+| `409` | Job is not `completed`, or the artifact file is not ready |
+
+If an artifact returns `409` immediately after a just-observed `completed`
+status, repeat the status request and retry the artifact: the worker may be in
+the short transition that finalizes artifact assembly.
+
+Examples:
+
+```json
+{
+  "detail": "Job is running"
+}
+```
+
+```json
+{
+  "detail": "Artifact was not requested"
+}
+```
+
+---
+
+## `DELETE /jobs/{job_id}`
+
+Requests cancellation. Pending pages are cancelled immediately. A page that
+already holds a worker lease may finish, but no additional page is claimed for
+the job.
+
+### Request
+
+```bash
+curl --fail-with-body -X DELETE \
+  -H "Authorization: Bearer $OCR_API_KEY" \
+  http://localhost:8080/jobs/16f86c44f021443f95df0c7af81c7f23
+```
+
+### `202 Accepted`
+
+Returns the same full job representation as `GET /jobs/{job_id}`. A queued job
+with no running page normally becomes `cancelled` immediately:
+
+```json
+{
+  "job_id": "16f86c44f021443f95df0c7af81c7f23",
+  "status": "cancelled",
+  "status_url": "/jobs/16f86c44f021443f95df0c7af81c7f23",
+  "result_urls": {
+    "markdown": "/jobs/16f86c44f021443f95df0c7af81c7f23/result/markdown"
+  },
+  "filename": "document.pdf",
+  "created_at": 1784017200.125,
+  "updated_at": 1784017202.914,
+  "completed_at": 1784017202.914,
+  "total_pages": 10,
+  "pending_pages": 0,
+  "running_pages": 0,
+  "completed_pages": 0,
+  "failed_pages": 0,
+  "cancellation_requested": true,
+  "retry_count": 0,
+  "error": null
+}
+```
+
+When a page is already running, the response may remain `running` with
+`cancellation_requested: true` until that page exits. Repeat status requests
+until the job becomes `cancelled`.
+
+Cancellation is idempotent for an existing terminal job: the endpoint returns
+its unchanged representation with `202`.
+
+### Errors
+
+| Status | Condition |
+|---:|---|
+| `401` | Bearer token is missing or invalid |
+| `404` | Job is unknown, expired, or owned by another token |
+
+---
+
+## Error format
+
+Application errors use FastAPI's standard `detail` envelope:
+
+```json
+{
+  "detail": "Human-readable error message"
+}
+```
+
+Request-validation failures return `422` with a structured list:
+
+```json
+{
+  "detail": [
+    {
+      "type": "missing",
+      "loc": ["body", "file"],
+      "msg": "Field required",
+      "input": null
+    }
+  ]
+}
+```
+
+Clients should branch on HTTP status and treat `detail` as diagnostic text, not
+as a stable machine error code.
+
+| Status | General meaning | Retry guidance |
+|---:|---|---|
+| `400` | PDF validation failed | Fix or replace the document |
+| `401` | Authentication failed | Correct the bearer token |
+| `404` | Resource is unavailable to this token | Do not retry indefinitely |
+| `409` | Artifact is not ready | Poll job status before retrying |
+| `413` | Upload is too large | Reduce file size or change server limit |
+| `415` | File extension/media type is unsupported | Correct the upload metadata/file type |
+| `422` | Request shape or query value is invalid | Correct the request |
+| `429` | PDF queue is full | Retry after the `Retry-After` delay |
+| `500` | Unexpected gateway failure | Retry with bounded backoff and investigate logs |
+| `502` | Synchronous backend inference failed | Retry with bounded backoff if appropriate |
+
+## End-to-end PDF client flow
+
+```text
+POST /parse/pdf
+  → save job_id and relative URLs
+  → GET status_url every 1-2 seconds
+      → queued/running/assembling: continue polling
+      → completed: download each result URL
+      → failed/cancelled: stop and inspect error/status
+```
+
+Minimal shell example:
+
+```bash
+BASE_URL=http://localhost:8080
+
+curl --fail-with-body -X POST \
+  "$BASE_URL/parse/pdf?output_format=both" \
+  -H "Authorization: Bearer $OCR_API_KEY" \
+  -F file=@document.pdf
+
+# Read job_id and status_url from the 202 response, then:
+curl --fail-with-body \
+  -H "Authorization: Bearer $OCR_API_KEY" \
+  "$BASE_URL/jobs/<job_id>"
+
+# After status becomes completed:
+curl --fail-with-body \
+  -H "Authorization: Bearer $OCR_API_KEY" \
+  -o result.json \
+  "$BASE_URL/jobs/<job_id>/result/json"
+```
+
+The API currently uses polling and does not expose webhooks or server-sent
+events.
+
+## Limits and retention
+
+| Setting | Default | Effect |
+|---|---:|---|
+| `MAX_FILE_SIZE_MB` | `100` | Maximum streamed upload size |
+| `MAX_PAGES` | `100` | Maximum accepted PDF page count |
+| `MAX_JOBS` | `20` | Maximum jobs in `queued` or `running` state |
+| `MAX_RETRIES` | `3` | Transient page-inference retries |
+| `LEASE_SECONDS` | `900` | Worker page lease duration before crash recovery |
+| `RETENTION_HOURS` | `24` | Terminal job and artifact retention |
+
+After retention cleanup, status and result requests return `404`. The SQLite
+database and artifacts use local Docker storage and are not shared across
+machines.

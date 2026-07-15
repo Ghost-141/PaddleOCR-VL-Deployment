@@ -8,7 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 class HealthResponse(BaseModel):
     status: str
-    triton_url: str
+    vllm_url: str
 
 
 class PageResult(BaseModel):

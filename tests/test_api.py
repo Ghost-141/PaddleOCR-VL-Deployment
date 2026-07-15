@@ -8,37 +8,28 @@ import pytest
 
 from paddlocr_vl.api.router import api_router
 from paddlocr_vl.core.config import Settings
+from paddlocr_vl.db.jobs import JobStore
 
 
-class FakeOCRService:
-    def __init__(self, *, loaded: bool = True, error: Exception | None = None) -> None:
-        self.loaded = loaded
-        self.error = error
-        self.calls: list[tuple[Path, Path]] = []
+class FakeVllmClient:
+    def __init__(self) -> None:
+        self.calls: list[Path] = []
 
-    def predict(self, input_path: Path, output_dir: Path) -> dict[str, Any]:
-        self.calls.append((input_path, output_dir))
-        assert input_path.is_file()
-        if self.error is not None:
-            raise self.error
-        output_dir.mkdir(parents=True, exist_ok=True)
+    def infer(self, path: Path, *, label: str = "document") -> dict[str, Any]:
+        self.calls.append(path)
+        assert path.is_file()
         return {
-            "processed_pages": 1,
-            "pages": [
-                {
-                    "page": 1,
-                    "json": {"parsing_res_list": []},
-                    "markdown": "Parsed text",
-                }
-            ],
-            "combined_markdown": "Parsed text",
+            "parsing_res_list": [
+                {"block_label": "text", "block_content": "Parsed text"}
+            ]
         }
 
 
-def make_client(settings: Settings, service: FakeOCRService) -> TestClient:
+def make_client(settings: Settings, vlm: FakeVllmClient | None = None) -> TestClient:
     app = FastAPI()
     app.state.settings = settings
-    app.state.ocr_service = service
+    app.state.job_store = JobStore(settings)
+    app.state.vllm_client = vlm or FakeVllmClient()
     app.include_router(api_router)
     return TestClient(app)
 
@@ -48,161 +39,139 @@ def auth_headers() -> dict[str, str]:
     return {"Authorization": "Bearer test-api-key"}
 
 
-def test_health_reports_pipeline_state(
-    settings_factory: Callable[..., Settings],
-) -> None:
-    settings = settings_factory()
-    client = make_client(settings, FakeOCRService(loaded=False))
-
-    response = client.get("/health")
-
+def test_health_reports_gateway_state(settings_factory: Callable[..., Settings]) -> None:
+    response = make_client(settings_factory()).get("/health")
     assert response.status_code == 200
     assert response.json() == {
-        "status": "starting",
-        "pipeline_loaded": False,
-        "vllm_server_url": settings.vllm_server_url,
-        "vllm_model": settings.vllm_model_name,
-        "layout_model": settings.layout_model_name,
+        "status": "healthy",
+        "vllm_url": "http://paddleocr-vlm-server:8118/v1",
     }
 
 
-@pytest.mark.parametrize(
-    ("headers", "status_code"),
-    [({}, 401), ({"Authorization": "Bearer wrong-key"}, 401)],
-)
-def test_parse_requires_valid_bearer_token(
-    settings_factory: Callable[..., Settings],
-    headers: dict[str, str],
-    status_code: int,
+@pytest.mark.parametrize("endpoint", ["/parse/image", "/jobs/unknown"])
+def test_protected_endpoints_require_bearer_token(
+    settings_factory: Callable[..., Settings], endpoint: str
 ) -> None:
-    client = make_client(settings_factory(), FakeOCRService())
-
-    response = client.post(
-        "/parse/image",
-        headers=headers,
-        files={"file": ("page.png", b"image", "image/png")},
+    client = make_client(settings_factory())
+    response = (
+        client.post(endpoint, files={"file": ("page.png", b"image", "image/png")})
+        if endpoint.startswith("/parse")
+        else client.get(endpoint)
     )
+    assert response.status_code == 401
 
-    assert response.status_code == status_code
 
-
-def test_parse_image_returns_both_formats_and_cleans_temp_files(
+def test_parse_image_calls_vllm_and_cleans_upload(
     settings_factory: Callable[..., Settings], auth_headers: dict[str, str]
 ) -> None:
     settings = settings_factory()
-    service = FakeOCRService()
-    client = make_client(settings, service)
-
-    response = client.post(
+    vlm = FakeVllmClient()
+    response = make_client(settings, vlm).post(
         "/parse/image",
         headers=auth_headers,
         files={"file": ("page.png", b"image-bytes", "image/png")},
     )
-
     assert response.status_code == 200
-    body = response.json()
-    assert body["filename"] == "page.png"
-    assert body["content_type"] == "image/png"
-    assert body["file_size_bytes"] == len(b"image-bytes")
-    assert body["processed_pages"] == 1
-    assert body["pages"][0]["markdown"] == "Parsed text"
-    assert body["combined_markdown"] == "Parsed text"
-    upload_path, output_dir = service.calls[0]
-    assert not upload_path.exists()
-    assert not output_dir.exists()
+    assert response.json()["combined_markdown"] == "Parsed text"
+    assert not vlm.calls[0].exists()
 
 
 @pytest.mark.parametrize("output_format", ["json", "markdown", "both"])
-def test_parse_pdf_output_formats(
+def test_parse_pdf_creates_durable_job_and_result_urls(
     settings_factory: Callable[..., Settings],
     auth_headers: dict[str, str],
     output_format: str,
 ) -> None:
-    client = make_client(settings_factory(), FakeOCRService())
-
-    response = client.post(
+    response = make_client(settings_factory()).post(
         f"/parse/pdf?output_format={output_format}",
         headers=auth_headers,
-        files={"file": ("document.pdf", b"%PDF-test", "application/pdf")},
+        files={"file": ("document.pdf", Path("test.pdf").read_bytes(), "application/pdf")},
     )
-
-    assert response.status_code == 200
-    if output_format == "markdown":
-        assert response.headers["content-type"].startswith("text/markdown")
-        assert response.headers["content-disposition"].endswith('.md"')
-        assert response.headers["x-processed-pages"] == "1"
-        assert response.text == "Parsed text"
-        return
-
+    assert response.status_code == 202
     body = response.json()
-    if output_format == "json":
-        assert "pages" in body
-        assert "combined_markdown" not in body
-        assert "markdown" not in body["pages"][0]
-    else:
-        assert body["combined_markdown"] == "Parsed text"
-        assert body["pages"][0]["markdown"] == "Parsed text"
-
-
-@pytest.mark.parametrize(
-    ("endpoint", "filename", "content_type"),
-    [
-        ("/parse/image", "document.pdf", "application/pdf"),
-        ("/parse/pdf", "page.png", "image/png"),
-        ("/parse/image", "page.gif", "image/gif"),
-    ],
-)
-def test_parse_rejects_wrong_file_type(
-    settings_factory: Callable[..., Settings],
-    auth_headers: dict[str, str],
-    endpoint: str,
-    filename: str,
-    content_type: str,
-) -> None:
-    client = make_client(settings_factory(), FakeOCRService())
-
-    response = client.post(
-        endpoint,
-        headers=auth_headers,
-        files={"file": (filename, b"content", content_type)},
+    assert body["status"] == "queued"
+    assert body["status_url"] == f"/jobs/{body['job_id']}"
+    assert set(body["result_urls"]) == (
+        {"json", "markdown"} if output_format == "both" else {output_format}
     )
 
-    assert response.status_code == 415
 
-
-def test_parse_rejects_oversized_upload_and_removes_partial_file(
-    settings_factory: Callable[..., Settings], auth_headers: dict[str, str]
-) -> None:
-    settings = settings_factory(max_file_size_mb=1)
-    service = FakeOCRService()
-    client = make_client(settings, service)
-
-    response = client.post(
-        "/parse/image",
-        headers=auth_headers,
-        files={"file": ("large.png", b"x" * (1024 * 1024 + 1), "image/png")},
-    )
-
-    assert response.status_code == 413
-    assert service.calls == []
-    assert not list(settings.upload_dir.glob("*"))
-
-
-def test_parse_maps_service_failure_to_bad_gateway_and_cleans_up(
+def test_status_result_and_cancel_are_authenticated(
     settings_factory: Callable[..., Settings], auth_headers: dict[str, str]
 ) -> None:
     settings = settings_factory()
-    service = FakeOCRService(error=RuntimeError("backend unavailable"))
-    client = make_client(settings, service)
+    client = make_client(settings)
+    submitted = client.post(
+        "/parse/pdf?output_format=markdown",
+        headers=auth_headers,
+        files={"file": ("document.pdf", Path("test.pdf").read_bytes(), "application/pdf")},
+    ).json()
+    job_id = submitted["job_id"]
+    assert client.get(f"/jobs/{job_id}", headers=auth_headers).json()["total_pages"] == 3
+    incomplete = client.get(f"/jobs/{job_id}/result/markdown", headers=auth_headers)
+    assert incomplete.status_code == 409
+    cancelled = client.delete(f"/jobs/{job_id}", headers=auth_headers)
+    assert cancelled.status_code == 202
+    assert cancelled.json()["status"] == "cancelled"
 
-    response = client.post(
+
+def test_completed_result_is_raw_file(
+    settings_factory: Callable[..., Settings], auth_headers: dict[str, str]
+) -> None:
+    settings = settings_factory()
+    store = JobStore(settings)
+    upload = settings.upload_dir / "done.pdf"
+    upload.write_bytes(b"pdf")
+    job = store.create_job(
+        owner_id=__import__("hashlib").sha256(b"test-api-key").hexdigest(),
+        filename="done.pdf",
+        output_format="markdown",
+        total_pages=1,
+        upload_path=upload,
+    )
+    Path(job["markdown_path"]).write_text("# Done\n")
+    with store.connect() as db:
+        db.execute("UPDATE jobs SET status='completed' WHERE id=?", (job["id"],))
+    app = FastAPI()
+    app.state.settings = settings
+    app.state.job_store = store
+    app.state.vllm_client = FakeVllmClient()
+    app.include_router(api_router)
+    response = TestClient(app).get(
+        f"/jobs/{job['id']}/result/markdown", headers=auth_headers
+    )
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/markdown")
+    assert response.text == "# Done\n"
+
+
+def test_pdf_rejects_corrupt_over_limit_oversize_and_full_queue(
+    settings_factory: Callable[..., Settings], auth_headers: dict[str, str]
+) -> None:
+    corrupt = make_client(settings_factory()).post(
         "/parse/pdf",
         headers=auth_headers,
-        files={"file": ("document.pdf", b"%PDF-test", "application/pdf")},
+        files={"file": ("bad.pdf", b"%PDF-bad", "application/pdf")},
     )
+    assert corrupt.status_code == 400
 
-    assert response.status_code == 502
-    assert "backend unavailable" in response.json()["detail"]
-    upload_path, output_dir = service.calls[0]
-    assert not upload_path.exists()
-    assert not output_dir.exists()
+    over_pages = make_client(settings_factory(max_pages=2)).post(
+        "/parse/pdf",
+        headers=auth_headers,
+        files={"file": ("long.pdf", Path("test.pdf").read_bytes(), "application/pdf")},
+    )
+    assert over_pages.status_code == 400
+
+    oversized = make_client(settings_factory(max_file_size_mb=1)).post(
+        "/parse/pdf",
+        headers=auth_headers,
+        files={"file": ("big.pdf", b"x" * (1024 * 1024 + 1), "application/pdf")},
+    )
+    assert oversized.status_code == 413
+
+    client = make_client(settings_factory(max_jobs=1))
+    payload = {"file": ("doc.pdf", Path("test.pdf").read_bytes(), "application/pdf")}
+    assert client.post("/parse/pdf", headers=auth_headers, files=payload).status_code == 202
+    full = client.post("/parse/pdf", headers=auth_headers, files=payload)
+    assert full.status_code == 429
+    assert full.headers["retry-after"] == "60"

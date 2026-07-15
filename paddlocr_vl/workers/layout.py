@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
 from pathlib import Path
 import socket
@@ -10,10 +9,10 @@ from typing import Any
 
 from PIL import Image
 
-from .core.config import Settings, load_settings
-from .jobs import JobStore
-from .pdf_utils import render_page
-from .service import LayoutClient, TritonError
+from ..core.config import Settings, load_settings
+from ..db.jobs import JobStore
+from ..utils.pdf_utils import render_page
+from ..service import LayoutClient, LayoutError
 
 
 def process_one(store: JobStore, client: LayoutClient, worker_id: str) -> bool:
@@ -32,7 +31,7 @@ def process_one(store: JobStore, client: LayoutClient, worker_id: str) -> bool:
             store.settings.max_regions_per_page,
         )
         store.enqueue_regions(task, regions)
-    except TritonError as exc:
+    except LayoutError as exc:
         store.fail_page(task, str(exc), exc.transient)
     except Exception as exc:
         store.fail_page(task, str(exc), False)

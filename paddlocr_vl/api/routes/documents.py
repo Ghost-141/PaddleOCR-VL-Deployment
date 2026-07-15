@@ -14,12 +14,12 @@ from ...core.dependencies import (
     get_job_store,
     get_owner_id,
     get_settings,
-    get_triton_client,
+    get_vllm_client,
 )
-from ...jobs import JobStore, QueueFullError
-from ...pdf_utils import EncryptedPDFError, InvalidPDFError, inspect_pdf
+from ...db.jobs import JobStore, QueueFullError
+from ...utils.pdf_utils import EncryptedPDFError, InvalidPDFError, inspect_pdf
 from ...schemas import OutputFormat, ParseResponse
-from ...service import TritonClient, TritonError
+from ...service import VllmClient, VllmError
 from ...utils.file_utils import json_compatible, save_upload, validate_image_upload, validate_upload
 from ...utils.markdown_assembler import assemble_page_markdown
 
@@ -32,7 +32,7 @@ router = APIRouter(tags=["documents"], dependencies=[Depends(authorize)])
 async def parse_image(
     file: Annotated[UploadFile, File(...)],
     settings: Annotated[Settings, Depends(get_settings)],
-    client: Annotated[TritonClient, Depends(get_triton_client)],
+    client: Annotated[VllmClient, Depends(get_vllm_client)],
 ) -> Response:
     extension = validate_image_upload(file)
     request_id = uuid.uuid4().hex
@@ -41,7 +41,7 @@ async def parse_image(
         size = await save_upload(file, upload_path, settings.max_file_size_bytes)
         try:
             page = await run_in_threadpool(client.infer, upload_path)
-        except TritonError as exc:
+        except VllmError as exc:
             raise HTTPException(502, f"Document parsing failed: {exc}") from exc
         markdown = assemble_page_markdown(page)
         return JSONResponse(

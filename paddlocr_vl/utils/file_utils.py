@@ -63,10 +63,6 @@ async def save_upload(file: UploadFile, destination: Path, max_bytes: int) -> in
     return total_size
 
 
-def read_json(path: Path) -> Any:
-    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
-
-
 def strip_markdown_images(markdown: str) -> str:
     """Remove generated image markup while retaining textual content."""
     markdown = DATA_IMAGE_TAG.sub("", markdown)

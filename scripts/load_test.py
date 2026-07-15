@@ -18,10 +18,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import mimetypes
 import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urljoin
 
 import httpx
 
@@ -34,6 +36,9 @@ class RequestResult:
     error: str | None = None
     processed_pages: int = 0
     response_size_bytes: int = 0
+    job_id: str | None = None
+    job_status: str | None = None
+    submission_latency_ms: float = 0.0
 
 
 @dataclass
@@ -50,7 +55,7 @@ class LoadTestResults:
 
     @property
     def successful(self) -> list[RequestResult]:
-        return [r for r in self.results if r.status_code == 200]
+        return [r for r in self.results if r.status_code == 200 and r.error is None]
 
     @property
     def failed(self) -> list[RequestResult]:
@@ -72,7 +77,9 @@ class LoadTestResults:
         lines.append("=" * 70)
         lines.append("")
         lines.append(f"  File:              {self.file_path}")
-        lines.append(f"  File size:         {self.file_size_bytes / 1024 / 1024:.1f} MB")
+        lines.append(
+            f"  File size:         {self.file_size_bytes / 1024 / 1024:.1f} MB"
+        )
         lines.append(f"  Endpoint:          {self.endpoint}")
         lines.append(f"  Concurrency:       {self.concurrency}")
         lines.append(f"  Output format:     {self.output_format}")
@@ -81,9 +88,11 @@ class LoadTestResults:
         lines.append("-" * 70)
         lines.append("  OUTCOMES")
         lines.append("-" * 70)
-        lines.append(f"  Success (200):     {len(self.successful)}")
+        lines.append(f"  Successful:        {len(self.successful)}")
         lines.append(f"  Failed:            {len(self.failed)}")
-        lines.append(f"  Success rate:      {len(self.successful) / self.total_requests * 100:.1f}%")
+        lines.append(
+            f"  Success rate:      {len(self.successful) / self.total_requests * 100:.1f}%"
+        )
         lines.append("")
         lines.append("-" * 70)
         lines.append("  LATENCY (successful requests)")
@@ -92,15 +101,27 @@ class LoadTestResults:
         if self.latencies:
             lats = sorted(self.latencies)
             n = len(lats)
-            lines.append(f"  Min:               {lats[0]:>10.0f} ms  ({lats[0] / 1000:.1f}s)")
-            lines.append(f"  Max:               {lats[-1]:>10.0f} ms  ({lats[-1] / 1000:.1f}s)")
-            lines.append(f"  Avg:               {sum(lats) / n:>10.0f} ms  ({sum(lats) / n / 1000:.1f}s)")
-            lines.append(f"  P50 (median):      {lats[n // 2]:>10.0f} ms  ({lats[n // 2] / 1000:.1f}s)")
+            lines.append(
+                f"  Min:               {lats[0]:>10.0f} ms  ({lats[0] / 1000:.1f}s)"
+            )
+            lines.append(
+                f"  Max:               {lats[-1]:>10.0f} ms  ({lats[-1] / 1000:.1f}s)"
+            )
+            lines.append(
+                f"  Avg:               {sum(lats) / n:>10.0f} ms  ({sum(lats) / n / 1000:.1f}s)"
+            )
+            lines.append(
+                f"  P50 (median):      {lats[n // 2]:>10.0f} ms  ({lats[n // 2] / 1000:.1f}s)"
+            )
             if n >= 20:
                 p95_idx = int(n * 0.95)
                 p99_idx = int(n * 0.99)
-                lines.append(f"  P95:               {lats[p95_idx]:>10.0f} ms  ({lats[p95_idx] / 1000:.1f}s)")
-                lines.append(f"  P99:               {lats[p99_idx]:>10.0f} ms  ({lats[p99_idx] / 1000:.1f}s)")
+                lines.append(
+                    f"  P95:               {lats[p95_idx]:>10.0f} ms  ({lats[p95_idx] / 1000:.1f}s)"
+                )
+                lines.append(
+                    f"  P99:               {lats[p99_idx]:>10.0f} ms  ({lats[p99_idx] / 1000:.1f}s)"
+                )
         else:
             lines.append("  No successful requests")
 
@@ -112,8 +133,12 @@ class LoadTestResults:
         if self.latencies:
             avg_latency_s = sum(self.latencies) / len(self.latencies) / 1000
             lines.append(f"  Avg latency:       {avg_latency_s:.1f}s")
-            lines.append(f"  Effective RPS:     {len(self.successful) / self.total_duration_s:.2f} req/s")
-        lines.append(f"  Throughput:        {self.file_size_bytes * len(self.successful) / 1024 / 1024 / self.total_duration_s:.2f} MB/s")
+            lines.append(
+                f"  Effective RPS:     {len(self.successful) / self.total_duration_s:.2f} req/s"
+            )
+        lines.append(
+            f"  Throughput:        {self.file_size_bytes * len(self.successful) / 1024 / 1024 / self.total_duration_s:.2f} MB/s"
+        )
         lines.append("")
 
         if self.failed:
@@ -132,10 +157,18 @@ class LoadTestResults:
         lines.append("  PER-REQUEST TIMELINE")
         lines.append("-" * 70)
         for r in self.results:
-            status = "OK" if r.status_code == 200 else f"ERR({r.status_code})"
-            err_msg = f" - {r.error}" if r.error and r.status_code != 200 else ""
+            status = (
+                "OK"
+                if r in self.successful
+                else f"ERR({r.job_status or r.status_code})"
+            )
+            err_msg = f" - {r.error}" if r.error else ""
             pages = f" [{r.processed_pages} pages]" if r.processed_pages else ""
-            size = f" ({r.response_size_bytes / 1024:.0f}KB)" if r.response_size_bytes else ""
+            size = (
+                f" ({r.response_size_bytes / 1024:.0f}KB)"
+                if r.response_size_bytes
+                else ""
+            )
             lines.append(
                 f"  #{r.request_num:>3d}  {status:>8s}  {r.latency_ms:>8.0f}ms"
                 f"{pages}{size}{err_msg}"
@@ -153,6 +186,8 @@ async def send_request(
     output_format: str,
     request_num: int,
     api_key: str,
+    timeout_s: float,
+    poll_interval_s: float,
 ) -> RequestResult:
     """Send a single request and return the result."""
     result = RequestResult(request_num=request_num)
@@ -162,18 +197,62 @@ async def send_request(
         headers = {"Authorization": f"Bearer {api_key}"}
         params = {"output_format": output_format} if "pdf" in endpoint else {}
 
-        files = {"file": (file_name, file_bytes, "application/pdf")}
+        content_type = mimetypes.guess_type(file_name)[0] or "application/octet-stream"
+        files = {"file": (file_name, file_bytes, content_type)}
         response = await client.post(
             endpoint,
             files=files,
             headers=headers,
             params=params,
-            timeout=None,  # no timeout — inference can take minutes
+            timeout=timeout_s,
         )
 
-        result.latency_ms = (time.perf_counter() - start) * 1000
-        result.status_code = response.status_code
         result.response_size_bytes = len(response.content)
+        result.submission_latency_ms = (time.perf_counter() - start) * 1000
+
+        if "pdf" in endpoint and response.status_code == 202:
+            submission = response.json()
+            result.job_id = submission["job_id"]
+            status_url = urljoin(str(response.url), submission["status_url"])
+            deadline = start + timeout_s
+            while time.perf_counter() < deadline:
+                status_response = await client.get(
+                    status_url,
+                    headers=headers,
+                    timeout=min(30, max(1, deadline - time.perf_counter())),
+                )
+                result.response_size_bytes += len(status_response.content)
+                if status_response.status_code != 200:
+                    result.status_code = status_response.status_code
+                    result.error = status_response.text[:200]
+                    break
+                job = status_response.json()
+                result.job_status = job["status"]
+                result.processed_pages = job.get("completed_pages", 0)
+                if result.job_status == "completed":
+                    for result_url in submission.get("result_urls", {}).values():
+                        artifact_response = await client.get(
+                            urljoin(str(response.url), result_url),
+                            headers=headers,
+                            timeout=30,
+                        )
+                        result.response_size_bytes += len(artifact_response.content)
+                        if artifact_response.status_code != 200:
+                            result.status_code = artifact_response.status_code
+                            result.error = artifact_response.text[:200]
+                            break
+                    else:
+                        result.status_code = 200
+                    break
+                if result.job_status in {"failed", "cancelled"}:
+                    result.status_code = 200
+                    result.error = job.get("error_summary") or result.job_status
+                    break
+                await asyncio.sleep(poll_interval_s)
+            else:
+                result.error = f"Job did not complete within {timeout_s:g}s"
+        else:
+            result.status_code = response.status_code
 
         if response.status_code == 200:
             if response.headers.get("content-type", "").startswith("text/markdown"):
@@ -181,9 +260,17 @@ async def send_request(
             else:
                 body = response.json()
                 result.processed_pages = body.get("processed_pages", 0)
-        else:
-            body = response.json() if response.headers.get("content-type", "").startswith("application/json") else {}
+        elif response.status_code != 202:
+            body = (
+                response.json()
+                if response.headers.get("content-type", "").startswith(
+                    "application/json"
+                )
+                else {}
+            )
             result.error = body.get("detail", response.text[:200])
+
+        result.latency_ms = (time.perf_counter() - start) * 1000
 
     except httpx.TimeoutException:
         result.latency_ms = (time.perf_counter() - start) * 1000
@@ -205,6 +292,8 @@ async def run_load_test(
     endpoint: str,
     concurrency: int,
     output_format: str,
+    timeout_s: float,
+    poll_interval_s: float,
 ) -> LoadTestResults:
     """Run the full load test."""
     file_size = file_path.stat().st_size
@@ -234,8 +323,15 @@ async def run_load_test(
         # Launch all requests concurrently
         tasks = [
             send_request(
-                client, file_bytes, file_path.name, full_url,
-                output_format, i + 1, api_key,
+                client,
+                file_bytes,
+                file_path.name,
+                full_url,
+                output_format,
+                i + 1,
+                api_key,
+                timeout_s,
+                poll_interval_s,
             )
             for i in range(concurrency)
         ]
@@ -246,7 +342,9 @@ async def run_load_test(
             result = await coro
             test.results.append(result)
             completed += 1
-            status = "OK" if result.status_code == 200 else f"FAIL({result.status_code})"
+            status = (
+                "OK" if result.status_code == 200 else f"FAIL({result.status_code})"
+            )
             print(
                 f"  [{completed:>3d}/{concurrency}]  "
                 f"#{result.request_num:>3d}  {status:>8s}  "
@@ -271,30 +369,52 @@ Examples:
     )
     parser.add_argument("file", type=Path, help="PDF or image file to upload")
     parser.add_argument(
-        "-n", "--concurrency", type=int, default=5,
+        "-n",
+        "--concurrency",
+        type=int,
+        default=5,
         help="Number of concurrent requests (default: 5)",
     )
     parser.add_argument(
-        "--endpoint", default="/parse/pdf",
+        "--endpoint",
+        default="/parse/pdf",
         choices=["/parse/pdf", "/parse/image"],
         help="API endpoint to test (default: /parse/pdf)",
     )
     parser.add_argument(
-        "--format", dest="output_format", default="both",
+        "--format",
+        dest="output_format",
+        default="both",
         choices=["json", "markdown", "both"],
         help="Output format to request (default: both)",
     )
     parser.add_argument(
-        "--base-url", default="http://localhost:8080",
+        "--base-url",
+        default="http://localhost:8080",
         help="API base URL (default: http://localhost:8080)",
     )
     parser.add_argument(
-        "--api-key", default=None,
+        "--api-key",
+        default=None,
         help="API key (reads from .env if not provided)",
     )
     parser.add_argument(
-        "--output", type=Path, default=None,
+        "--output",
+        type=Path,
+        default=None,
         help="Save detailed results to JSON file",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=1800,
+        help="Per-request/job timeout in seconds (default: 1800)",
+    )
+    parser.add_argument(
+        "--poll-interval",
+        type=float,
+        default=2,
+        help="PDF job status polling interval in seconds (default: 2)",
     )
     return parser.parse_args()
 
@@ -319,14 +439,24 @@ def main() -> None:
         sys.exit(1)
 
     # Auto-detect endpoint from file extension
-    if args.endpoint == "/parse/pdf" and args.file.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".tiff", ".tif"}:
+    if args.endpoint == "/parse/pdf" and args.file.suffix.lower() in {
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".webp",
+        ".tiff",
+        ".tif",
+    }:
         args.endpoint = "/parse/image"
         print(f"  Auto-detected image file, using {args.endpoint}")
 
     # Load API key
     api_key = args.api_key or load_api_key()
     if not api_key:
-        print("Error: No API key. Set --api-key or PUBLIC_API_KEY in .env", file=sys.stderr)
+        print(
+            "Error: No API key. Set --api-key or PUBLIC_API_KEY in .env",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     # Run the test
@@ -338,6 +468,8 @@ def main() -> None:
             endpoint=args.endpoint,
             concurrency=args.concurrency,
             output_format=args.output_format,
+            timeout_s=args.timeout,
+            poll_interval_s=args.poll_interval,
         )
     )
 
@@ -365,6 +497,9 @@ def main() -> None:
                     "error": r.error,
                     "processed_pages": r.processed_pages,
                     "response_size_bytes": r.response_size_bytes,
+                    "job_id": r.job_id,
+                    "job_status": r.job_status,
+                    "submission_latency_ms": r.submission_latency_ms,
                 }
                 for r in test.results
             ],

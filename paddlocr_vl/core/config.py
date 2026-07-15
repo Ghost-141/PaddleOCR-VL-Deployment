@@ -10,8 +10,8 @@ from dotenv import load_dotenv
 @dataclass(frozen=True, slots=True)
 class Settings:
     public_api_key: str
-    triton_url: str = "http://triton:8000"
-    triton_model: str = "layout-parsing"
+    vllm_url: str = "http://paddleocr-vlm-server:8118/v1"
+    vllm_model: str = "PaddleOCR-VL-1.6-0.9B"
     layout_url: str = "http://layout:8090"
     data_dir: Path = Path("/data")
     max_file_size_mb: int = 100
@@ -47,8 +47,8 @@ def load_settings() -> Settings:
         raise RuntimeError("PUBLIC_API_KEY must be configured")
     settings = Settings(
         public_api_key=api_key,
-        triton_url=os.getenv("TRITON_URL", "http://triton:8000").rstrip("/"),
-        triton_model=os.getenv("TRITON_MODEL", "layout-parsing"),
+        vllm_url=os.getenv("VLLM_URL", "http://paddleocr-vlm-server:8118/v1").rstrip("/"),
+        vllm_model=os.getenv("VLLM_MODEL", "PaddleOCR-VL-1.6-0.9B"),
         layout_url=os.getenv("LAYOUT_URL", "http://layout:8090").rstrip("/"),
         data_dir=Path(os.getenv("DATA_DIR", "/data")),
         max_file_size_mb=int(os.getenv("MAX_FILE_SIZE_MB", "100")),

@@ -1,9 +1,8 @@
 # Async PaddleOCR-VL API
 
 Authenticated document parsing for one NVIDIA GPU. FastAPI accepts work, SQLite
-stores durable page tasks, four workers render PDF pages with `pypdfium2`, Triton
-runs layout detection on the selected device, and vLLM continuously batches the
-vision-language requests on the GPU.
+stores durable page tasks, a fixed CPU layout pool produces cropped document
+regions, and a separate fixed VLM pool keeps vLLM supplied from that queue.
 
 Only FastAPI is published, on `APP_PORT` (8080 by default). PaddleOCR and
 PaddlePaddle are not installed in the API/worker image.
@@ -11,8 +10,8 @@ PaddlePaddle are not installed in the API/worker image.
 ## Run
 
 Requirements: Docker Compose v2, NVIDIA Container Toolkit, and one supported
-NVIDIA GPU. The default CPU layout mode also needs enough host RAM for four
-layout-pipeline instances.
+NVIDIA GPU. The CPU layout pool needs host RAM for one PP-DocLayoutV3 model per
+`LAYOUT_REPLICAS` instance.
 
 ```bash
 cp .env.example .env
@@ -20,88 +19,156 @@ openssl rand -hex 32  # put this value in PUBLIC_API_KEY
 docker compose up --build
 ```
 
-`LAYOUT_DEVICE` selects the matching PaddleX HPS image and runtime device.
-The vendored official SDK selects `config_cpu.pbtxt` or `config_gpu.pbtxt` at
-startup. CPU mode has four Triton instances; GPU mode has one. VL recognition
-concurrency is two in `deploy/hps/server/pipeline_config.yaml`.
+`layout` runs the official PaddleX `PP-DocLayoutV3` model on the device selected
+by `LAYOUT_DEVICE`. VLM workers send the cropped regions directly to the shared
+vLLM server; no Triton/HPS container is started.
 
 ```env
 LAYOUT_DEVICE=cpu
-PADDLEX_HPS_USE_HPIP=0
 ```
-
-HPIP remains disabled by default because PP-DocLayoutV3 is not currently
-compatible with the attempted Paddle2ONNX conversion in this deployment.
 
 The one-shot `model-setup` service only downloads the pinned PP-DocLayoutV3
-model. The official PaddleOCR-VL 1.6 / PaddleX 3.7 HPS server is checked in at
-`deploy/hps/server` with no dynamic batching and vLLM configured at
-`http://paddleocr-vlm-server:8118/v1`.
+model. The direct VLM client uses vLLM's OpenAI-compatible endpoint.
 
-Apply HPS configuration changes with:
-
-```bash
-docker compose up -d --force-recreate triton
-```
+This is a validation deployment: region output is returned as one Markdown
+block per layout crop. Compare representative PDFs with the previous HPS path
+before treating it as a production-quality replacement.
 
 ## Hardware tuning
 
 Start with the profile closest to the deployment host, then change one value at
-a time and compare pages/second, p95 job latency, Triton memory, vLLM waiting
+a time and compare pages/second, p95 job latency, layout memory, vLLM waiting
 requests, and GPU memory. These are starting points, not capacity guarantees.
 
-| Host | Layout device | HPS instances | Workers | VL concurrency |
-|---|---|---:|---:|---:|
-| 8 CPU cores, 16 GB RAM | CPU | 1-2 | 2 | 1-2 |
-| 16 CPU cores, 32 GB RAM, one 24 GB GPU | CPU | 4 | 4 | 2 |
-| 32+ CPU cores, 64+ GB RAM, one GPU | CPU | 6-8 | 6-8 | 2 |
-| CPU-constrained host sharing one GPU with vLLM | GPU | 1 | 2-4 | 1-2 |
-| Separate layout GPU | GPU | 1-2 per GPU | 4-8 | 2 |
+| Host | Layout replicas | Layout workers | VLM workers |
+|---|---|---:|---:|
+| 16 CPU cores, 32 GB RAM, one 24 GB GPU, CPU layout | 4 | 4 | 8 |
+| 32+ CPU cores, 64+ GB RAM, one 24 GB GPU, CPU layout | 6 | 6 | 48 |
+| One 24 GB GPU, GPU layout | 1 | 2 | 32 |
 
 The main controls are in different files:
 
 | Control | File | Effect |
 |---|---|---|
-| Layout device | `.env`: `LAYOUT_DEVICE=cpu|gpu` | Selects the HPS image and CPU/GPU Triton config |
-| CPU instances | `deploy/hps/server/model_repo/layout-parsing/config_cpu.pbtxt` | Independent CPU page pipelines; each copy consumes RAM |
-| GPU instances | `deploy/hps/server/model_repo/layout-parsing/config_gpu.pbtxt` | Independent GPU page pipelines; each copy consumes GPU memory |
-| VL concurrency | `deploy/hps/server/pipeline_config.yaml`: `max_concurrency` | Maximum simultaneous vLLM calls from each HPS instance |
-| PDF workers | `compose.yaml`: `worker.deploy.replicas` | Number of pages that can be submitted to Triton concurrently |
+| Layout producers | `.env`: `LAYOUT_REPLICAS` | Fixed PP-DocLayoutV3 model processes |
+| Threads per layout process | `.env`: `LAYOUT_THREADS` | Caps CPU thread oversubscription across layout replicas |
+| Layout workers | `.env`: `LAYOUT_WORKER_REPLICAS` | Render pages and feed the layout pool |
+| VLM workers | `.env`: `VLM_WORKER_REPLICAS` | Region consumers feeding vLLM |
+| Per-document page depth | `.env`: `MAX_PAGES_PER_JOB` | Bounded number of in-flight pages from one PDF; preserves a durable, fair producer queue |
+| Per-page region bound | `.env`: `MAX_REGIONS_PER_PAGE` | Protects disk, queue depth, and latency on dense pages |
 
-Keep HPS instances and workers close to each other. Extra instances usually sit
-idle when there are fewer workers, while too many workers only add queueing when
-all instances are busy. A single PDF is limited to two running pages, so higher
-worker counts primarily help when several documents are queued.
+For CPU layout on the 32-core host, start with six layout processes, six layout workers, and
+48 VLM workers. vLLM batches their recognition calls directly. `MAX_PAGES_PER_JOB=12` gives the region
+queue enough look-ahead to supply those consumers; `MAX_REGIONS_PER_PAGE=64`
+protects disk and latency on dense pages.
 
-The maximum possible VL fan-out is approximately `HPS instances x
-max_concurrency`, although rendering, layout detection, page contents, and the
-worker count usually make the observed value lower. Increasing only vLLM
-`max-num-seqs` does not create more work when vLLM is waiting for the CPU layout
-stage.
+For GPU layout, set `LAYOUT_DEVICE=gpu`, keep exactly one layout replica, and
+start with two layout workers and 32 VLM workers. The layout model and vLLM
+share the GPU, so use vLLM memory headroom before raising VLM concurrency.
 
-Leave Triton dynamic batching disabled for this Python pipeline. The
-`max_batch_size: 8` declarations describe accepted request batches; they do not
-combine the separate one-page requests sent by the workers. Keep HPIP disabled
-unless the installed PP-DocLayoutV3 version successfully passes a separate HPIP
-compatibility test.
+### Tune GPU layout production
 
-For the default 16-core/32-GB/24-GB-GPU host, use CPU layout, four HPS instances,
-four workers, and `max_concurrency: 2`. Try `max_concurrency: 3` only when vLLM
-has no sustained waiting queue and GPU memory has headroom. Try more CPU HPS
-instances only when workers are waiting for Triton and host CPU/RAM have
-headroom. Docker CPU percentages are per core: on a 16-core host, `1600%` is the
-whole machine and `100%` is one core.
+GPU layout is the fixed deployment mode. Keep these values fixed:
 
-Initial vLLM limits are in `deploy/vllm_config.yaml`:
+```env
+LAYOUT_DEVICE=gpu
+LAYOUT_REPLICAS=1
+LAYOUT_THREADS=1
+```
+
+One layout replica avoids loading a second copy of PP-DocLayoutV3 onto the same
+GPU as vLLM. `LAYOUT_THREADS` does not increase GPU inference throughput.
+`LAYOUT_WORKER_REPLICAS` is the only layout setting to tune; it controls how
+many pages can render and wait to call that one layout service.
+
+| Load-test observation | `LAYOUT_WORKER_REPLICAS` action |
+|---|---|
+| vLLM `waiting` is near zero and GPU use is low | Raise one step: `2 → 3 → 4`. Retest after each step. |
+| vLLM has a sustained waiting queue | Keep it at `2`; layout is already supplying enough work. |
+| Layout service errors, higher page latency, or GPU memory pressure | Return to `2`; do not add layout replicas. |
+
+Change the value in `.env` and recreate only the producer pool:
+
+```bash
+docker compose up -d --build --force-recreate layout-worker
+```
+
+If VLM workers are idle, add layout capacity. If the stored region queue grows
+continually, the GPU is full and the fixed pool is correctly applying
+backpressure. vLLM batches independent region requests across all documents.
+
+Docker CPU percentages are per core: on a 32-core host, `3200%` is the whole
+machine and `100%` is one core.
+
+vLLM limits are in `deploy/vllm_config.yaml`. Start with the profile matching
+the GPU arrangement, then change one value and repeat the same load test.
 
 ```yaml
-gpu-memory-utilization: 0.40
-max-num-seqs: 2
+gpu-memory-utilization: 0.55
+max-num-seqs: 64
 max-model-len: 8192
-max-num-batched-tokens: 8192
-enforce-eager: true
+max-num-batched-tokens: 32768
+enforce-eager: false
 mm-processor-cache-gb: 0
 ```
+
+### Tune vLLM for available hardware
+
+| Hardware arrangement | GPU memory utilization | Max sequences | Batched tokens | Notes |
+|---|---:|---:|---:|---|
+| 16 GB GPU shared with GPU layout | `0.40` | `32` | `16384` | Conservative starting point; leave memory for layout. |
+| 24 GB GPU shared with GPU layout | `0.55` | `64` | `32768` | Recommended starting point for this deployment. |
+| 24 GB GPU, vLLM only | `0.70` | `128` | `49152` | Use only when layout runs on CPU or another GPU. |
+| 48 GB+ GPU, vLLM only | `0.75` | `128` | `65536` | Raise further only after measuring throughput and VRAM. |
+
+`gpu-memory-utilization` reserves VRAM for vLLM's weights, activations, and KV
+cache. Leave room for the layout model when it shares the GPU. `max-num-seqs`
+limits concurrently admitted requests. `max-num-batched-tokens` limits how much
+prefill work vLLM packs into one scheduler step. `max-model-len` is a request
+ceiling, not a throughput control; keep it at `8192` unless documents require
+more context. `mm-processor-cache-gb: 0` is appropriate because OCR regions are
+normally unique images.
+
+Use the scheduler gauges and GPU monitoring to choose the next change:
+
+| Observation during a steady load test | Change |
+|---|---|
+| `waiting` stays above zero; GPU is below 70%; VRAM has headroom | Raise `max-num-batched-tokens` one step: `16384 → 32768 → 49152`. |
+| `waiting` stays above zero; GPU is below 70%; batched tokens are already at 49152 | Raise `max-num-seqs` one step: `32 → 64 → 96 → 128`. |
+| GPU is below 70%; waiting is near zero | Do not raise vLLM limits; increase layout/region production or incoming load. |
+| GPU is above 85%; waiting grows; latency rises | The GPU is saturated; do not add VLM workers. |
+| CUDA OOM, layout failures, or little free VRAM | Lower `gpu-memory-utilization` by `0.05`, then lower sequences if needed. |
+
+Set `enforce-eager: false` to allow CUDA graphs. Confirm it took effect after
+restart: the vLLM startup log must not say `Cudagraph is disabled under eager
+mode`. If it does, the running container is using a different configuration
+file or an old container.
+
+After editing the file, recreate vLLM and wait for it to become healthy:
+
+```bash
+docker compose up -d --force-recreate paddleocr-vlm-server
+docker compose logs --tail=100 paddleocr-vlm-server
+```
+
+### Observe vLLM running and waiting requests
+
+From the project directory, print the scheduler gauges:
+
+```bash
+docker compose exec -T paddleocr-vlm-server \
+  sh -c 'curl -fsS http://localhost:8118/metrics | grep -E "vllm:num_requests_(running|waiting)"'
+```
+
+Refresh them once per second during a load test:
+
+```bash
+watch -n 1 'docker compose exec -T paddleocr-vlm-server sh -c "curl -fsS http://localhost:8118/metrics | grep -E '\''vllm:num_requests_(running|waiting)'\''"'
+```
+
+`running` is work admitted to vLLM; `waiting` is GPU backlog. A sustained
+waiting value means the GPU is saturated, while both values near zero means
+the layout/region producers are not supplying vLLM.
 
 ## API
 
@@ -171,31 +238,31 @@ may be deleted.
 Apply changes according to what was edited:
 
 ```bash
-# HPS pipeline or Triton config
-docker compose up -d --force-recreate triton
+# Layout service configuration
+docker compose up -d --force-recreate layout
 
 # vLLM settings in deploy/vllm_config.yaml
-docker compose up -d --force-recreate paddleocr-vlm-server triton
+docker compose up -d --force-recreate paddleocr-vlm-server
 
-# API/worker Python, requirements, or Dockerfile
-docker compose up -d --build api worker
+# API, layout-worker, or vlm-worker Python
+docker compose up -d --build api layout-worker vlm-worker
 
 # .env or compose.yaml changes across the stack
 docker compose up -d --force-recreate
 ```
 
-After changing `worker.deploy.replicas`, reconcile the workers with:
+After changing fixed pool values in `.env`, recreate the pools with:
 
 ```bash
-docker compose up -d worker
+docker compose up -d --force-recreate layout layout-worker vlm-worker
 ```
 
 Inspect status and logs:
 
 ```bash
 docker compose ps
-docker compose logs --tail=200 triton
-docker compose logs -f api worker triton paddleocr-vlm-server
+docker compose logs --tail=200 paddleocr-vlm-server
+docker compose logs -f api layout layout-worker vlm-worker paddleocr-vlm-server
 docker compose top
 docker compose events
 ```
@@ -244,7 +311,7 @@ docker compose ps --all
 docker compose logs --tail=300 model-setup
 docker compose logs --tail=300 paddleocr-vlm-server
 docker compose logs --tail=300 triton
-docker compose logs --tail=300 api worker
+docker compose logs --tail=300 api layout layout-worker vlm-worker
 ```
 
 For an interactive restart that keeps the failing service attached to the
@@ -272,8 +339,8 @@ worker crashes, transient backend failures receive three bounded retries, and
 terminal jobs are removed after 24 hours. Data lives in the local `app-data`
 volume; do not place the SQLite database on NFS.
 
-Use `LAYOUT_DEVICE=gpu` when CPU layout detection starves vLLM, then compare
-pages per second, p95 latency, and GPU memory against the default CPU mode.
+The region queue is durable in SQLite, so queued regions resume after either
+fixed worker pool restarts.
 
 ## Development
 

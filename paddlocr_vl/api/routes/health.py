@@ -13,4 +13,4 @@ router = APIRouter(tags=["health"])
 
 @router.get("/health", response_model=HealthResponse)
 def health(settings: Annotated[Settings, Depends(get_settings)]) -> dict[str, str]:
-    return {"status": "healthy", "triton_url": settings.triton_url}
+    return {"status": "healthy", "vllm_url": settings.vllm_url}

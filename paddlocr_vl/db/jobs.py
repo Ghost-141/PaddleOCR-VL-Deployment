@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Iterator
 import uuid
 
-from .core.config import Settings
+from ..core.config import Settings
 
 TERMINAL = {"completed", "failed", "cancelled"}
 
