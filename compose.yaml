@@ -43,34 +43,6 @@ services:
       timeout: 5s
       retries: 10
 
-  triton:
-    image: ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlex/hps:paddlex3.7-cpu
-    working_dir: /app
-    environment:
-      PADDLEX_HPS_DEVICE_TYPE: cpu
-      PADDLEX_HPS_USE_HPIP: ${PADDLEX_HPS_USE_HPIP:-0}
-    volumes:
-      - ./deploy/hps/server:/app:ro
-      - models:/models:ro
-    command: ["/bin/bash", "server.sh"]
-    shm_size: 8gb
-    restart: unless-stopped
-    depends_on:
-      model-setup:
-        condition: service_completed_successfully
-      paddleocr-vlm-server:
-        condition: service_healthy
-    healthcheck:
-      test:
-        - CMD
-        - python3
-        - -c
-        - "import urllib.request; urllib.request.urlopen('http://localhost:8000/v2/health/ready', timeout=4).close()"
-      start_period: 5m
-      interval: 15s
-      timeout: 5s
-      retries: 10
-
   layout:
     image: ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlex/hps:paddlex3.7-${LAYOUT_DEVICE:-cpu}
     environment:
@@ -107,7 +79,8 @@ services:
       - "${APP_PORT:-8080}:8080"
     environment: &app-environment
       PUBLIC_API_KEY: ${PUBLIC_API_KEY:?Set PUBLIC_API_KEY in .env}
-      TRITON_URL: http://triton:8000
+      VLLM_URL: http://paddleocr-vlm-server:8118/v1
+      VLLM_MODEL: ${VLLM_MODEL:-PaddleOCR-VL-1.6-0.9B}
       LAYOUT_URL: http://layout:8090
       DATA_DIR: /data
       MAX_FILE_SIZE_MB: ${MAX_FILE_SIZE_MB:-100}
@@ -122,7 +95,7 @@ services:
       - app-data:/data
     restart: unless-stopped
     depends_on:
-      triton:
+      paddleocr-vlm-server:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health || exit 1"]
@@ -151,7 +124,7 @@ services:
       - app-data:/data
     restart: unless-stopped
     depends_on:
-      triton:
+      paddleocr-vlm-server:
         condition: service_healthy
     deploy:
       replicas: ${VLM_WORKER_REPLICAS:-48}
