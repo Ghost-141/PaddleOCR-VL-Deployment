@@ -138,7 +138,7 @@ def _merge_one(
     try:
         page_path = _merge_page(store, task)
         job = store.complete_region_page(task, page_path)
-        if job["status"] == "completed" and (claimed := store.claim_assembly(task["job_id"])):
+        if job and job["status"] == "completed" and (claimed := store.claim_assembly(task["job_id"])):
             assemble_artifacts(claimed)
             store.complete_assembly(task["job_id"])
     except Exception as exc:

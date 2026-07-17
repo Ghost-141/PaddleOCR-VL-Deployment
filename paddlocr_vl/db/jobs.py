@@ -34,6 +34,9 @@ class JobStore:
         try:
             yield connection
             connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
         finally:
             connection.close()
 
@@ -225,11 +228,12 @@ class JobStore:
             if not page:
                 return None
             expires = now + self.settings.lease_seconds
+            lease_owner = uuid.uuid4().hex
             changed = db.execute(
                 """UPDATE pages SET status='running', attempts=attempts+1,
                    lease_owner=?, lease_expires=?
                    WHERE job_id=? AND page_number=? AND status='pending'""",
-                (worker_id, expires, page["job_id"], page["page_number"]),
+                (lease_owner, expires, page["job_id"], page["page_number"]),
             ).rowcount
             if not changed:
                 return None
@@ -242,6 +246,7 @@ class JobStore:
                 "job_id": page["job_id"],
                 "page_number": page["page_number"],
                 "attempts": page["attempts"] + 1,
+                "lease_owner": lease_owner,
                 "upload_path": page["upload_path"],
                 "lease_expires": expires,
             }
@@ -253,17 +258,31 @@ class JobStore:
             db.execute(
                 """UPDATE pages SET status='completed', result_path=?, error=NULL,
                    lease_owner=NULL, lease_expires=NULL
-                   WHERE job_id=? AND page_number=? AND status='running'""",
-                (str(result_path), task["job_id"], task["page_number"]),
+                   WHERE job_id=? AND page_number=? AND status='running'
+                     AND attempts=? AND lease_owner=?""",
+                (
+                    str(result_path),
+                    task["job_id"],
+                    task["page_number"],
+                    task["attempts"],
+                    task["lease_owner"],
+                ),
             )
             self._sync(db, task["job_id"], now)
         return self.get(task["job_id"])  # type: ignore[return-value]
 
-    def enqueue_regions(self, task: dict[str, Any], regions: list[dict[str, Any]]) -> None:
+    def enqueue_regions(self, task: dict[str, Any], regions: list[dict[str, Any]]) -> bool:
         """Release a rendered page into the durable VLM-region queue."""
         now = time.time()
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            claimed = db.execute(
+                """SELECT 1 FROM pages WHERE job_id=? AND page_number=? AND status='running'
+                     AND attempts=? AND lease_owner=?""",
+                (task["job_id"], task["page_number"], task["attempts"], task["lease_owner"]),
+            ).fetchone()
+            if not claimed:
+                return False
             db.executemany(
                 """INSERT INTO regions(job_id, page_number, region_number, label, bbox, crop_path)
                    VALUES (?, ?, ?, ?, ?, ?)""",
@@ -281,10 +300,12 @@ class JobStore:
             )
             db.execute(
                 """UPDATE pages SET status='recognizing', lease_owner=NULL, lease_expires=NULL,
-                   error=NULL WHERE job_id=? AND page_number=? AND status='running'""",
-                (task["job_id"], task["page_number"]),
+                   error=NULL WHERE job_id=? AND page_number=? AND status='running'
+                     AND attempts=? AND lease_owner=?""",
+                (task["job_id"], task["page_number"], task["attempts"], task["lease_owner"]),
             )
             self._sync(db, task["job_id"], now)
+        return True
 
     def claim_region(self, worker_id: str) -> dict[str, Any] | None:
         claimed = self.claim_regions(worker_id, 1)
@@ -298,12 +319,34 @@ class JobStore:
         claimed: list[dict[str, Any]] = []
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            db.execute(
-                """UPDATE regions SET status='pending', lease_owner=NULL, lease_expires=NULL,
-                   available_at=?, error='worker lease expired'
-                   WHERE status='running' AND lease_expires < ?""",
-                (now, now),
-            )
+            expired = db.execute(
+                """SELECT r.job_id, r.page_number, r.region_number, r.attempts,
+                          j.cancellation_requested
+                   FROM regions r JOIN jobs j ON j.id=r.job_id
+                   WHERE r.status='running' AND r.lease_expires < ?""",
+                (now,),
+            ).fetchall()
+            touched: set[str] = set()
+            for region in expired:
+                status = "cancelled" if region["cancellation_requested"] else (
+                    "pending" if region["attempts"] <= self.settings.max_retries else "failed"
+                )
+                db.execute(
+                    """UPDATE regions SET status=?, lease_owner=NULL, lease_expires=NULL,
+                       available_at=?, error='worker lease expired'
+                       WHERE job_id=? AND page_number=? AND region_number=?""",
+                    (status, now, region["job_id"], region["page_number"], region["region_number"]),
+                )
+                if status == "failed":
+                    db.execute(
+                        """UPDATE pages SET status='failed', error='worker lease expired',
+                           lease_owner=NULL, lease_expires=NULL
+                           WHERE job_id=? AND page_number=?""",
+                        (region["job_id"], region["page_number"]),
+                    )
+                touched.add(region["job_id"])
+            for job_id in touched:
+                self._sync(db, job_id, now)
             for _ in range(limit):
                 region = db.execute(
                     """SELECT r.job_id, r.page_number, r.region_number, r.attempts, r.label,
@@ -318,11 +361,12 @@ class JobStore:
                 if not region:
                     break
                 expires = now + self.settings.lease_seconds
+                lease_owner = uuid.uuid4().hex
                 changed = db.execute(
                     """UPDATE regions SET status='running', attempts=attempts+1,
                        lease_owner=?, lease_expires=?
                        WHERE job_id=? AND page_number=? AND region_number=? AND status='pending'""",
-                    (worker_id, expires, region["job_id"], region["page_number"], region["region_number"]),
+                    (lease_owner, expires, region["job_id"], region["page_number"], region["region_number"]),
                 ).rowcount
                 if not changed:
                     continue
@@ -331,7 +375,12 @@ class JobStore:
                     (now, now, region["job_id"]),
                 )
                 claimed.append(
-                    {**dict(region), "attempts": region["attempts"] + 1, "lease_expires": expires}
+                    {
+                        **dict(region),
+                        "attempts": region["attempts"] + 1,
+                        "lease_owner": lease_owner,
+                        "lease_expires": expires,
+                    }
                 )
         return claimed
 
@@ -340,12 +389,22 @@ class JobStore:
         now = time.time()
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            db.execute(
+            changed = db.execute(
                 """UPDATE regions SET status='completed', result_path=?, error=NULL,
                    lease_owner=NULL, lease_expires=NULL
-                   WHERE job_id=? AND page_number=? AND region_number=? AND status='running'""",
-                (str(result_path), task["job_id"], task["page_number"], task["region_number"]),
-            )
+                   WHERE job_id=? AND page_number=? AND region_number=? AND status='running'
+                     AND attempts=? AND lease_owner=?""",
+                (
+                    str(result_path),
+                    task["job_id"],
+                    task["page_number"],
+                    task["region_number"],
+                    task["attempts"],
+                    task["lease_owner"],
+                ),
+            ).rowcount
+            if not changed:
+                return False
             remaining = db.execute(
                 """SELECT count(*) FROM regions WHERE job_id=? AND page_number=?
                    AND status != 'completed'""",
@@ -384,12 +443,13 @@ class JobStore:
             ).fetchone()
             if not page:
                 return None
+            lease_owner = uuid.uuid4().hex
             changed = db.execute(
                 """UPDATE pages SET status='merging', lease_owner=?, lease_expires=?
                    WHERE job_id=? AND page_number=? AND status='recognizing'""",
-                (worker_id, now + self.settings.lease_seconds, page["job_id"], page["page_number"]),
+                (lease_owner, now + self.settings.lease_seconds, page["job_id"], page["page_number"]),
             ).rowcount
-            return dict(page) if changed else None
+            return {**dict(page), "lease_owner": lease_owner} if changed else None
 
     def region_results(self, job_id: str, page_number: int) -> list[dict[str, Any]]:
         with self.connect() as db:
@@ -401,15 +461,18 @@ class JobStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def complete_region_page(self, task: dict[str, Any], result_path: Path) -> dict[str, Any]:
+    def complete_region_page(self, task: dict[str, Any], result_path: Path) -> dict[str, Any] | None:
         now = time.time()
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            db.execute(
+            changed = db.execute(
                 """UPDATE pages SET status='completed', result_path=?, lease_owner=NULL,
-                   lease_expires=NULL WHERE job_id=? AND page_number=? AND status='merging'""",
-                (str(result_path), task["job_id"], task["page_number"]),
-            )
+                   lease_expires=NULL WHERE job_id=? AND page_number=? AND status='merging'
+                     AND lease_owner=?""",
+                (str(result_path), task["job_id"], task["page_number"], task["lease_owner"]),
+            ).rowcount
+            if not changed:
+                return None
             self._sync(db, task["job_id"], now)
         return self.get(task["job_id"])  # type: ignore[return-value]
 
@@ -418,16 +481,23 @@ class JobStore:
         retry = transient and task["attempts"] <= self.settings.max_retries
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            db.execute(
+            changed = db.execute(
                 """UPDATE regions SET status=?, available_at=?, error=?, lease_owner=NULL,
                    lease_expires=NULL WHERE job_id=? AND page_number=? AND region_number=?
-                   AND status='running'""",
+                   AND status='running' AND attempts=? AND lease_owner=?""",
                 (
                     "pending" if retry else "failed",
                     now + min(30, 2 ** max(0, task["attempts"] - 1)) if retry else now,
-                    error_message[:2000], task["job_id"], task["page_number"], task["region_number"],
+                    error_message[:2000],
+                    task["job_id"],
+                    task["page_number"],
+                    task["region_number"],
+                    task["attempts"],
+                    task["lease_owner"],
                 ),
-            )
+            ).rowcount
+            if not changed:
+                return
             if not retry:
                 db.execute(
                     """UPDATE pages SET status='failed', error=?, lease_owner=NULL, lease_expires=NULL
@@ -445,18 +515,23 @@ class JobStore:
         retry = transient and task["attempts"] <= self.settings.max_retries
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            db.execute(
+            changed = db.execute(
                 """UPDATE pages SET status=?, available_at=?, error=?,
                    lease_owner=NULL, lease_expires=NULL
-                   WHERE job_id=? AND page_number=? AND status='running'""",
+                   WHERE job_id=? AND page_number=? AND status='running'
+                     AND attempts=? AND lease_owner=?""",
                 (
                     "pending" if retry else "failed",
                     now + min(30, 2 ** max(0, task["attempts"] - 1)) if retry else now,
                     error_message[:2000],
                     task["job_id"],
                     task["page_number"],
+                    task["attempts"],
+                    task["lease_owner"],
                 ),
-            )
+            ).rowcount
+            if not changed:
+                return
             db.execute(
                 """UPDATE jobs SET retry_count=retry_count+?, error_summary=?, updated_at=?
                    WHERE id=?""",

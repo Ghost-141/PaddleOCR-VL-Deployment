@@ -1,4 +1,5 @@
 from pathlib import Path
+import time
 
 from paddlocr_vl.db.jobs import JobStore
 
@@ -54,3 +55,53 @@ def test_claim_regions_leases_a_batch(settings_factory, tmp_path: Path) -> None:
     assert len({task["region_number"] for task in claimed}) == 2
     with store.connect() as db:
         assert db.execute("SELECT count(*) FROM regions WHERE status='running'").fetchone()[0] == 2
+
+
+def test_stale_region_lease_cannot_finish_or_fail_a_reclaimed_region(settings_factory, tmp_path: Path) -> None:
+    store = JobStore(settings_factory())
+    upload = tmp_path / "lease.pdf"
+    upload.write_bytes(b"pdf")
+    store.create_job(
+        owner_id="owner", filename="lease.pdf", output_format="json", total_pages=1, upload_path=upload
+    )
+    page = store.claim("layout")
+    assert page
+    store.enqueue_regions(
+        page, [{"label": "text", "bbox": [0, 0, 1, 1], "crop_path": str(tmp_path / "crop.jpg")}]
+    )
+    stale = store.claim_region("first")
+    assert stale
+    with store.connect() as db:
+        db.execute("UPDATE regions SET lease_expires=?", (time.time() - 1,))
+    current = store.claim_region("replacement")
+    assert current and current["attempts"] == 2
+
+    assert store.finish_region(stale, tmp_path / "stale.json") is False
+    store.fail_region(stale, "late failure", transient=False)
+    with store.connect() as db:
+        status, attempts = db.execute("SELECT status, attempts FROM regions").fetchone()
+    assert (status, attempts) == ("running", 2)
+    assert store.finish_region(current, tmp_path / "current.json") is True
+
+
+def test_expired_region_stops_after_the_retry_limit(settings_factory, tmp_path: Path) -> None:
+    store = JobStore(settings_factory(max_retries=1))
+    upload = tmp_path / "retry.pdf"
+    upload.write_bytes(b"pdf")
+    job = store.create_job(
+        owner_id="owner", filename="retry.pdf", output_format="json", total_pages=1, upload_path=upload
+    )
+    page = store.claim("layout")
+    assert page
+    store.enqueue_regions(
+        page, [{"label": "text", "bbox": [0, 0, 1, 1], "crop_path": str(tmp_path / "crop.jpg")}]
+    )
+    assert store.claim_region("first")
+    with store.connect() as db:
+        db.execute("UPDATE regions SET lease_expires=?", (time.time() - 1,))
+    assert store.claim_region("second")
+    with store.connect() as db:
+        db.execute("UPDATE regions SET lease_expires=?", (time.time() - 1,))
+
+    assert store.claim_region("third") is None
+    assert store.get(job["id"])["status"] == "failed"  # type: ignore[index]
