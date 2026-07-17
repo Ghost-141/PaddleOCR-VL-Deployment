@@ -26,7 +26,7 @@ def process_one(store: JobStore, client: LayoutClient, worker_id: str) -> bool:
         regions = _crop_regions(
             rendered,
             client.detect(rendered),
-            job_dir / "regions",
+            job_dir / "regions" / f"{task['page_number']:06d}-{task['attempts']:04d}",
             task["page_number"],
             store.settings.max_regions_per_page,
         )

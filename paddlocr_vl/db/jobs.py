@@ -347,41 +347,48 @@ class JobStore:
                 touched.add(region["job_id"])
             for job_id in touched:
                 self._sync(db, job_id, now)
-            for _ in range(limit):
-                region = db.execute(
-                    """SELECT r.job_id, r.page_number, r.region_number, r.attempts, r.label,
-                              r.bbox, r.crop_path
+            regions = db.execute(
+                """WITH candidates AS (
+                       SELECT r.job_id, r.page_number, r.region_number, r.attempts, r.label,
+                              r.bbox, r.crop_path, j.last_claimed_at, j.created_at,
+                              ROW_NUMBER() OVER (
+                                  PARTITION BY r.job_id ORDER BY r.page_number, r.region_number
+                              ) AS job_rank
                        FROM regions r JOIN jobs j ON j.id=r.job_id
                        WHERE r.status='pending' AND r.available_at <= ?
                          AND j.cancellation_requested=0
-                       ORDER BY COALESCE(j.last_claimed_at, 0), j.created_at,
-                                r.page_number, r.region_number LIMIT 1""",
-                    (now,),
-                ).fetchone()
-                if not region:
-                    break
-                expires = now + self.settings.lease_seconds
-                lease_owner = uuid.uuid4().hex
-                changed = db.execute(
-                    """UPDATE regions SET status='running', attempts=attempts+1,
-                       lease_owner=?, lease_expires=?
-                       WHERE job_id=? AND page_number=? AND region_number=? AND status='pending'""",
-                    (lease_owner, expires, region["job_id"], region["page_number"], region["region_number"]),
-                ).rowcount
-                if not changed:
-                    continue
-                db.execute(
-                    "UPDATE jobs SET last_claimed_at=?, updated_at=? WHERE id=?",
-                    (now, now, region["job_id"]),
-                )
-                claimed.append(
-                    {
-                        **dict(region),
-                        "attempts": region["attempts"] + 1,
-                        "lease_owner": lease_owner,
-                        "lease_expires": expires,
-                    }
-                )
+                   )
+                   SELECT job_id, page_number, region_number, attempts, label, bbox, crop_path
+                   FROM candidates
+                   ORDER BY job_rank, COALESCE(last_claimed_at, 0), created_at,
+                            page_number, region_number
+                   LIMIT ?""",
+                (now, limit),
+            ).fetchall()
+            expires = now + self.settings.lease_seconds
+            leases = [
+                (uuid.uuid4().hex, expires, region["job_id"], region["page_number"], region["region_number"])
+                for region in regions
+            ]
+            db.executemany(
+                """UPDATE regions SET status='running', attempts=attempts+1,
+                   lease_owner=?, lease_expires=?
+                   WHERE job_id=? AND page_number=? AND region_number=? AND status='pending'""",
+                leases,
+            )
+            db.executemany(
+                "UPDATE jobs SET last_claimed_at=?, updated_at=? WHERE id=?",
+                ((now, now, region["job_id"]) for region in regions),
+            )
+            claimed = [
+                {
+                    **dict(region),
+                    "attempts": region["attempts"] + 1,
+                    "lease_owner": lease_owner,
+                    "lease_expires": expires,
+                }
+                for region, (lease_owner, *_rest) in zip(regions, leases, strict=True)
+            ]
         return claimed
 
     def finish_region(self, task: dict[str, Any], result_path: Path) -> bool:
@@ -460,6 +467,17 @@ class JobStore:
                 (job_id, page_number),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def delete_region_artifacts(self, job_id: str, page_number: int) -> None:
+        with self.connect() as db:
+            rows = db.execute(
+                """SELECT crop_path, result_path FROM regions
+                   WHERE job_id=? AND page_number=? AND status='completed'""",
+                (job_id, page_number),
+            ).fetchall()
+        for row in rows:
+            Path(row["crop_path"]).unlink(missing_ok=True)
+            Path(row["result_path"]).unlink(missing_ok=True)
 
     def complete_region_page(self, task: dict[str, Any], result_path: Path) -> dict[str, Any] | None:
         now = time.time()

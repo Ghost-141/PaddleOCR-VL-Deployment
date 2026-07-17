@@ -25,7 +25,7 @@ async def process_one(
 ) -> None:
     result_path = (
         store.settings.jobs_dir / task["job_id"] / "regions"
-        / f"{task['page_number']:06d}-{task['region_number']:04d}.json"
+        / f"{task['page_number']:06d}-{task['region_number']:04d}-{task['attempts']:04d}.json"
     )
     try:
         result = await client.infer_async(http_client, Path(task["crop_path"]), label=task["label"])
@@ -138,6 +138,8 @@ def _merge_one(
     try:
         page_path = _merge_page(store, task)
         job = store.complete_region_page(task, page_path)
+        if job:
+            store.delete_region_artifacts(task["job_id"], task["page_number"])
         if job and job["status"] == "completed" and (claimed := store.claim_assembly(task["job_id"])):
             assemble_artifacts(claimed)
             store.complete_assembly(task["job_id"])
@@ -163,7 +165,7 @@ async def run(settings: Settings) -> None:
                     )
             if in_flight:
                 done, in_flight = await asyncio.wait(
-                    in_flight, timeout=0.02, return_when=asyncio.FIRST_COMPLETED
+                    in_flight, return_when=asyncio.FIRST_COMPLETED
                 )
                 for task in done:
                     task.result()

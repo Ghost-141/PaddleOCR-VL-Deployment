@@ -10,7 +10,13 @@ def test_assemble_artifacts_orders_pages_and_merges_table_headers(settings_facto
     store = JobStore(settings)
     upload = settings.upload_dir / "document.pdf"
     upload.write_bytes(b"pdf")
-    job = store.create_job("owner", "document.pdf", "both", 2, upload)
+    job = store.create_job(
+        owner_id="owner",
+        filename="document.pdf",
+        output_format="both",
+        total_pages=2,
+        upload_path=upload,
+    )
     pages = Path(job["json_path"]).parent / "pages"
     pages.mkdir(exist_ok=True)
     table = "| A | B |\n|---|---|\n| 1 | 2 |"
