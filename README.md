@@ -34,7 +34,7 @@ inference, and fixed worker pools. The layout model and vLLM share one GPU.
 
 See the API reference for authentication, exact parameters, response formats, examples, limits, and error codes.
 
-## Requirements to run and deploy
+## Requirements
 
 - A Linux host with Docker Engine and Docker Compose v2.
 - An NVIDIA GPU, supported NVIDIA driver, and NVIDIA Container Toolkit.
@@ -43,7 +43,7 @@ See the API reference for authentication, exact parameters, response formats, ex
 - Currently it can handle **20** active pdf jobs by default and can be adjusted using the `MAX_JOBS` variable on `.env`.
 
 
-## Verify GPU access before deploying:
+### Verify GPU access
 
 ```bash
 nvidia-smi
@@ -111,7 +111,7 @@ docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi
 
 The `model-step` download and pins the `PP-DocLayoutV3` model for the first time and uses it for all runs. The first run make take a while depending on the internet connectivity. 
 
-## Usage
+## Use the API
 
 Install the Python client dependency:
 
@@ -168,7 +168,7 @@ the completed document.
 See [docs/API.md](docs/API.md) for image parsing,
 cancellation, errors, and the full API contract.
 
-## Hardware tuning
+## Performance tuning
 
 The current config was tested on a 24 GB VRAM based NVIDIA GPU with 16GB ram and 16 Core CPU. Make sure to adjust the config based on your hardware.
 
@@ -256,7 +256,7 @@ Docker CPU percentages are per core: on a 32-core host, `3200%` is the whole mac
 vLLM limits are in `deploy/vllm_config.yaml`. Start with the profile matching the GPU arrangement, then change one value and repeat the same load test.
 
 
-### Tuning vLLM Config 
+### Tune vLLM
 
 | Hardware VRAM | GPU memory utilization | Max sequences | Batched tokens | Notes |
 |---|---:|---:|---:|---|
@@ -304,7 +304,9 @@ waiting value means the GPU is saturated, while both values near zero means
 the layout/region producers are not supplying vLLM.
 
 
-## Apply New Settings & Restarts 
+## Operations
+
+### Apply settings and restart services
 
 
 1. Stop and resume containers without deleting them:
@@ -353,7 +355,7 @@ Do not add `--volumes` unless all jobs, results, downloaded models, and caches m
     docker compose up -d --force-recreate layout layout-worker vlm-worker
     ```
 
-## Troubleshooting & Debugging
+### Troubleshooting and debugging
 
 Inspect status and logs:
 
@@ -389,7 +391,7 @@ nvidia-smi
 nvidia-smi dmon -s pucm
 ```
 
-### Watch SQLite queue state
+#### Watch SQLite queue state
 
 Run this from the project directory to refresh job, page, and region status
 counts every two seconds. Press `Ctrl+C` to stop it.
